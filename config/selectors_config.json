@@ -6,30 +6,14 @@
 
   "selectors": {
     "login": {
-      "username_field": [
-        { "type": "id", "value": "login-username" },
-        { "type": "name", "value": "username" },
-        { "type": "name", "value": "user" },
-        { "type": "name", "value": "email" },
-        { "type": "id", "value": "username" },
-        { "type": "id", "value": "user" },
-        { "type": "id", "value": "email" },
-        { "type": "css", "value": "input[type='text']" },
-        { "type": "css", "value": "input[type='email']" }
-      ],
-      "password_field": [
-        { "type": "id", "value": "login-password" },
-        { "type": "name", "value": "password" },
-        { "type": "name", "value": "pass" },
-        { "type": "id", "value": "password" },
-        { "type": "css", "value": "input[type='password']" }
-      ],
+      "username_field": [{ "type": "name", "value": "login[user]" }],
+      "password_field": [{ "type": "name", "value": "login[pass]" }],
       "submit_button": [
         { "type": "css", "value": "input[type='submit']" },
         { "type": "css", "value": "button[type='submit']" },
         { "type": "css", "value": "button.btn-primary" }
       ],
-      "verification_markers": ["logout", "hallo"]
+      "verification_markers": ["<a href=\"logout\">Logout</a>"]
     },
 
     "series_list": {
@@ -90,7 +74,7 @@
     "page_load_delay": 0.2,
     "action_delay": 0.1,
     "season_load_delay": 0.2,
-    "login_delay": 0.8,
+    "login_delay": 0.2,
     "initial_delay": 0.5,
     "timeout": 8
   }
