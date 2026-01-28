@@ -1,0 +1,58 @@
+# Environment variables
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.github/copilot-instructions.md
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Data files (optional - comment out to track)
+# data/*.json
+
+# Logs
+*.log
+# Data files (user-generated, don't track)
+data/*.json
+
+# User-specific series URLs
+series_urls.txt
+
+# Scraper pause/worker files
+/data/.scrape_pause
+/data/.worker_pids.json
+
+# Personal data files
+/data/series_index.json
+/data/series_report.json

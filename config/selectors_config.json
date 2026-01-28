@@ -1,0 +1,97 @@
+{
+  "site_name": "bs.to",
+  "site_url": "https://bs.to",
+  "login_page": "https://bs.to/login",
+  "series_list_page": "/andere-serien",
+
+  "selectors": {
+    "login": {
+      "username_field": [
+        { "type": "id", "value": "login-username" },
+        { "type": "name", "value": "username" },
+        { "type": "name", "value": "user" },
+        { "type": "name", "value": "email" },
+        { "type": "id", "value": "username" },
+        { "type": "id", "value": "user" },
+        { "type": "id", "value": "email" },
+        { "type": "css", "value": "input[type='text']" },
+        { "type": "css", "value": "input[type='email']" }
+      ],
+      "password_field": [
+        { "type": "id", "value": "login-password" },
+        { "type": "name", "value": "password" },
+        { "type": "name", "value": "pass" },
+        { "type": "id", "value": "password" },
+        { "type": "css", "value": "input[type='password']" }
+      ],
+      "submit_button": [
+        { "type": "css", "value": "input[type='submit']" },
+        { "type": "css", "value": "button[type='submit']" },
+        { "type": "css", "value": "button.btn-primary" }
+      ],
+      "verification_markers": ["logout", "hallo"]
+    },
+
+    "series_list": {
+      "series_links": {
+        "type": "css",
+        "value": "a[href*='/serie/']",
+        "description": "All series links on series list page"
+      },
+      "filter_descriptions": ["Cover vorschlagen", "Beschreibung vorschlagen"]
+    },
+
+    "series_page": {
+      "title": {
+        "type": "tag",
+        "value": "h2",
+        "description": "Series title in h2 tag"
+      },
+      "seasons_selector": {
+        "type": "id",
+        "value": "seasons",
+        "description": "Seasons dropdown container"
+      },
+      "season_links": {
+        "type": "css",
+        "value": "#seasons a",
+        "description": "Individual season links"
+      },
+      "season_watched_class": {
+        "full": "watched",
+        "none": "",
+        "description": "CSS class on season link: 'watched' = all episodes seen (green), no class = unwatched (grey), 'active' = partial/current"
+      }
+    },
+
+    "episodes": {
+      "table": {
+        "type": "css",
+        "value": "table.episodes",
+        "description": "Episodes table"
+      },
+      "table_rows": {
+        "type": "css",
+        "value": "table.episodes tr",
+        "description": "Episode rows"
+      },
+      "watched_indicator": {
+        "type": "row_class",
+        "value": "watched",
+        "description": "Watched status via row class attribute"
+      },
+      "episode_number_cell": 0,
+      "episode_title_cell": 1,
+      "episode_title_selector": "strong"
+    }
+  },
+
+  "timing": {
+    "page_load_delay": 0.2,
+    "action_delay": 0.1,
+    "season_load_delay": 0.2,
+    "login_delay": 0.8,
+    "initial_delay": 0.5,
+    "timeout": 8
+  }
+}
