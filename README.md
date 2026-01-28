@@ -7,7 +7,6 @@ A Python tool to automatically scrape your watched TV series from the bs.to webs
 ✨ **High-Performance Scraping**
 
 - **Parallel processing** with up to 24 concurrent workers
-- Optimized for modern multi-core CPUs (tested on Ryzen 7 7600X)
 - Cookie-based authentication for worker threads
 - **~10-15 minutes** to scrape 10,000+ series
 - Automatic login to your bs.to account
