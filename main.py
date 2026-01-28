@@ -414,6 +414,16 @@ def retry_failed_series():
         print(f"\n✗ Retry failed: {str(e)}")
 
 
+def pause_scraping():
+    """Create a pause file to signal workers to pause scraping"""
+    pause_file = os.path.join(DATA_DIR, '.pause_scraping')
+    try:
+        with open(pause_file, 'w', encoding='utf-8') as f:
+            f.write('PAUSE')
+        print(f"\n✓ Pause file created: {pause_file}\nWorkers will pause at next checkpoint.")
+    except Exception as e:
+        print(f"\n✗ Failed to create pause file: {str(e)}")
+
 def show_active_workers():
     """Display active worker processes"""
     worker_pids_file = os.path.join(os.path.dirname(__file__), 'data', '.worker_pids.json')
