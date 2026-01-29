@@ -507,8 +507,9 @@ class BsToScraper:
     def get_season_links(self, html, base_url):
         """Extract season links from season selector (includes specials/season 0)
         
-        Returns list of tuples: (label, href, watched_status)
+        Returns list of tuples: (label, href, watched_status, season_type)
         watched_status: 'full' = all watched (green), 'none' = unwatched (grey), 'partial' = needs loading
+        season_type: 'regular' for numbered seasons, or the special label (e.g., 'OVA', 'Special', 'Movie', etc.)
         """
         soup = BeautifulSoup(html, 'html.parser')
         season_links = []
@@ -538,13 +539,11 @@ class BsToScraper:
             for a in season_elems:
                 label = a.get_text(strip=True)
                 href = a.get('href', '')
-                
                 if not href.startswith('http'):
                     site_url = self.get_site_url()
                     href = f"{site_url}/{href.lstrip('/')}"
-                
+
                 # Detect watched status from parent <li> element's CSS class
-                # Structure: li.watched > a (the watched class is on the li, not the a)
                 parent_li = a.find_parent('li')
                 if parent_li:
                     classes = parent_li.get('class', [])
@@ -552,24 +551,30 @@ class BsToScraper:
                     classes = []
                 if isinstance(classes, str):
                     classes = classes.split()
-                
+
                 if full_watched_class and full_watched_class in classes:
                     watched_status = 'full'  # All episodes watched (green) - skip loading
                 else:
-                    # No 'watched' class on parent li - needs loading to check episodes
                     watched_status = 'none'
-                
-                season_links.append((label, href, watched_status))
+
+                # Tag season type: 'regular' or special label
+                if is_regular_season(label):
+                    season_type = 'regular'
+                else:
+                    # Use the label as the type for specials (e.g., 'OVA', 'Special', 'Movie', etc.)
+                    season_type = label
+
+                season_links.append((label, href, watched_status, season_type))
 
         # Deduplicate while preserving order
         seen = set()
         unique = []
-        for label, href, watched_status in season_links:
-            key = (label, href)
+        for entry in season_links:
+            # entry: (label, href, watched_status, season_type)
+            key = (entry[0], entry[1])
             if key not in seen:
                 seen.add(key)
-                unique.append((label, href, watched_status))
-        
+                unique.append(entry)
         return unique
     
     # ==================== EPISODE SCRAPING ====================
@@ -677,19 +682,23 @@ class BsToScraper:
             assume_grey_unwatched = False
 
             for idx, season_item in enumerate(season_links):
-                # Handle both old format (label, url) and new format (label, url, status)
-                if len(season_item) == 3:
+                # Handle new format (label, url, watched_status, season_type)
+                if len(season_item) == 4:
+                    season_label, season_url, watched_status, season_type = season_item
+                elif len(season_item) == 3:
                     season_label, season_url, watched_status = season_item
+                    season_type = 'regular' if is_regular_season(season_label) else season_label
                 else:
                     season_label, season_url = season_item
                     watched_status = "none"  # Unknown, needs loading
+                    season_type = 'regular' if is_regular_season(season_label) else season_label
                 
                 try:
                     cached_season = existing_seasons.get(season_label)
                     
                     # Parallel mode: if we've confirmed series is unwatched, skip grey REGULAR seasons
                     # Special seasons (OVA, Movies, Specials) are always checked individually
-                    if parallel_mode and assume_grey_unwatched and watched_status == 'none' and is_regular_season(season_label):
+                    if parallel_mode and assume_grey_unwatched and watched_status == 'none' and season_type == 'regular':
                         if cached_season and cached_season.get('episodes'):
                             # Use cached episodes, mark all unwatched
                             episodes = []
@@ -1334,19 +1343,23 @@ class BsToScraper:
             assume_grey_unwatched = False
             
             for idx, season_item in enumerate(season_links):
-                # Handle both old format (label, url) and new format (label, url, status)
-                if len(season_item) == 3:
+                # Handle new format (label, url, watched_status, season_type)
+                if len(season_item) == 4:
+                    season_label, season_url, watched_status, season_type = season_item
+                elif len(season_item) == 3:
                     season_label, season_url, watched_status = season_item
+                    season_type = 'regular' if is_regular_season(season_label) else season_label
                 else:
                     season_label, season_url = season_item
                     watched_status = "none"
+                    season_type = 'regular' if is_regular_season(season_label) else season_label
                 
                 try:
                     cached_season = existing_seasons.get(season_label)
                     
                     # Parallel optimization: if we've confirmed series is unwatched, skip grey REGULAR seasons
                     # Special seasons (OVA, Movies, Specials) are always checked individually
-                    if assume_grey_unwatched and watched_status == 'none' and is_regular_season(season_label):
+                    if assume_grey_unwatched and watched_status == 'none' and season_type == 'regular':
                         if cached_season and cached_season.get('episodes'):
                             # Use cached episodes, mark all unwatched
                             episodes = []
