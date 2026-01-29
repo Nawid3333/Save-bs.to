@@ -213,13 +213,14 @@ class BsToScraper:
     def wait_for_element(self, driver, selector_by, selector_value, timeout=None):
         """Wait for element to be present and visible"""
         if timeout is None:
-            timeout = self.get_timing('timeout')
+            timeout = self.get_timing('timeout') or 15
         try:
             WebDriverWait(driver, timeout).until(
                 EC.presence_of_element_located((selector_by, selector_value))
             )
             return True
-        except:
+        except Exception as e:
+            print(f"✗ Timeout or error waiting for element: {selector_value} ({e})")
             return False
     
     def wait_for_css_element(self, driver, css_selector, timeout=None):
@@ -239,15 +240,21 @@ class BsToScraper:
     
     def load_checkpoint(self):
         """Load checkpoint to resume from previous run"""
+        import json
+        if not os.path.exists(self.checkpoint_file):
+            return False
         try:
-            if os.path.exists(self.checkpoint_file):
-                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    self.completed_links = set(data or [])
-                    return True
-        except Exception:
-            pass
-        return False
+            with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Basic validation: must be a dict with expected keys
+            if not isinstance(data, dict) or 'series' not in data:
+                print(f"✗ Checkpoint file is invalid or corrupted.")
+                return False
+            self.completed_links = set(data.get('completed_links', []))
+            return True
+        except Exception as e:
+            print(f"✗ Failed to load checkpoint: {e}")
+            return False
     
     def clear_checkpoint(self):
         """Clear checkpoint after successful completion"""

@@ -284,25 +284,29 @@ def confirm_and_save_changes(new_data, description="data"):
     """
 
     # Load current index as old_data
+    old_data = []
     if os.path.exists(SERIES_INDEX_FILE):
         try:
             with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                 old_data = json.load(f)
+            if not isinstance(old_data, (list, dict)):
+                print(f"\u26a0 Index file is not a valid list or dict, ignoring.")
+                logging.error(f"Index file is not a valid list or dict.")
+                old_data = []
             logging.info(f"Loaded index from {SERIES_INDEX_FILE} ({len(old_data)} entries)")
         except Exception as e:
-            print(f"⚠ Error loading index: {str(e)}")
+            print(f"\u26a0 Error loading index: {str(e)}")
             logging.error(f"Error loading index: {str(e)}")
             old_data = []
     else:
-        old_data = []
         logging.info(f"No existing index found at {SERIES_INDEX_FILE}")
 
-    # Convert new_data to dict for merging
+    # Compute changes between old and new data
+    # Ensure new_data is a dict for merging
     if isinstance(new_data, list):
         new_dict = {s.get('title'): s for s in new_data}
     else:
-        new_dict = new_data
-
+        new_dict = dict(new_data)
     changes = print_changes(old_data, new_dict)
     logging.info(f"Detected changes: { {k: len(v) for k,v in changes.items()} }")
 
@@ -441,14 +445,32 @@ class IndexManager:
         os.makedirs(DATA_DIR, exist_ok=True)
 
     def load_index(self):
+        """
+        Load the series index from file, handling both list and dict formats.
+        Always converts to a dict mapping titles to series objects for internal use.
+        """
+        self.series_index = {}
         if os.path.exists(SERIES_INDEX_FILE):
             try:
                 with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
+                # Handle both formats robustly
                 if isinstance(data, list):
-                    self.series_index = {item.get("title"): item for item in data}
+                    # List of series objects
+                    self.series_index = {item.get("title"): item for item in data if item.get("title")}
+                elif isinstance(data, dict):
+                    # Dict: check if it's a mapping of title->series
+                    # If values are series objects with 'title', keep as is
+                    # If not, try to convert
+                    first_item = next(iter(data.values()), None)
+                    if first_item and isinstance(first_item, dict) and first_item.get('title'):
+                        self.series_index = data
+                    else:
+                        # Unexpected dict format, try to convert
+                        self.series_index = {item.get("title"): item for item in data.values() if isinstance(item, dict) and item.get("title")}
                 else:
-                    self.series_index = data
+                    # Unknown format, fallback to empty
+                    self.series_index = {}
                 print(f"✓ Loaded {len(self.series_index)} series from index")
                 logging.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
             except Exception as e:

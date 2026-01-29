@@ -7,6 +7,21 @@ Automatically scrapes your watched TV series from bs.to and maintains a local in
 import json
 import sys
 import os
+import logging
+from requests.exceptions import RequestException
+from urllib.parse import urlparse
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('scraper.log'),
+        logging.StreamHandler()
+    ]
+)
+
+logger = logging.getLogger(__name__)
 
 # Add src directory to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
@@ -55,22 +70,27 @@ def scrape_series():
     print("\n→ Starting BS.TO scraper...")
     print("  (Browser will open - do not close it manually)\n")
     
-    # Check if checkpoint exists
-    checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
-    resume = False
-    if os.path.exists(checkpoint_file):
-        print("⚠ Checkpoint found from previous run!\n")
-        choice = input("Resume from checkpoint? (y/n): ").strip().lower()
-        resume = choice == 'y'
-    
-    # Ask for scraping mode
-    print("\nScraping mode:")
-    print("  1. Sequential (slower, but most reliable)")
-    print("  2. Parallel (faster, uses multiple workers)\n")
-    mode_choice = input("Choose mode (1-2) [default: 2]: ").strip() or '2'
-    use_parallel = mode_choice == '2'
-    
     try:
+        # Check if checkpoint exists
+        checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
+        resume = False
+        if os.path.exists(checkpoint_file):
+            print("⚠ Checkpoint found from previous run!\n")
+            choice = input("Resume from checkpoint? (y/n): ").strip().lower()
+            resume = choice == 'y'
+        
+        # Validate user input for scraping mode
+        print("\nScraping mode:")
+        print("  1. Sequential (slower, but most reliable)")
+        print("  2. Parallel (faster, uses multiple workers)\n")
+        mode_choice = input("Choose mode (1-2) [default: 2]: ").strip() or '2'
+        
+        if mode_choice not in ['1', '2']:
+            print("⚠ Invalid choice, using default (parallel)")
+            use_parallel = True
+        else:
+            use_parallel = mode_choice == '2'
+        
         scraper = BsToScraper()
         scraper.run(SERIES_INDEX_FILE, resume_only=resume, parallel=use_parallel)
         
@@ -78,17 +98,27 @@ def scrape_series():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Scraped data"):
                 print("\n✓ Scraping completed successfully!")
+                logger.info("Scraping completed successfully")
         else:
             print("\n⚠ No data scraped")
+            logger.warning("No data scraped during scraping operation")
         
+    except RequestException as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error in scrape_series: {e}")
+    except KeyboardInterrupt:
+        print("\n⚠ Scraping interrupted by user")
+        logger.info("Scraping interrupted by user")
     except Exception as e:
-        print(f"\n✗ Scraping failed: {str(e)}")
+        print(f"\n✗ Unexpected error during scraping: {str(e)}")
+        logger.error(f"Unexpected error in scrape_series: {e}")
 
 
 def scrape_new_series():
     """Execute scraping only for new series not yet in the index"""
     print("\n→ Starting BS.TO scraper (NEW series only)...")
     print("  (Browser will open - do not close it manually)\n")
+    
     try:
         scraper = BsToScraper()
         scraper.run(SERIES_INDEX_FILE, new_only=True)
@@ -97,10 +127,19 @@ def scrape_new_series():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "New series data"):
                 print("\n✓ New series scraping completed successfully!")
+                logger.info("New series scraping completed successfully")
         else:
             print("\n⚠ No new series found")
+            logger.warning("No new series found during scraping operation")
+    except RequestException as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error in scrape_new_series: {e}")
+    except KeyboardInterrupt:
+        print("\n⚠ Scraping interrupted by user")
+        logger.info("New series scraping interrupted by user")
     except Exception as e:
-        print(f"\n✗ New-only scraping failed: {str(e)}")
+        print(f"\n✗ Unexpected error during new-only scraping: {str(e)}")
+        logger.error(f"Unexpected error in scrape_new_series: {e}")
 
 
 def create_progress_bar(percent, width=20):
@@ -156,7 +195,9 @@ def show_series_with_progress():
         print("✗ No series found\n")
         return
     
+
     page_size = 25
+    max_pages = 20  # Prevent infinite pagination
 
     title_width = 32 if compact else 40
     bar_width = 14 if compact else 20
@@ -171,14 +212,12 @@ def show_series_with_progress():
         print(f"\nPage {page_num} ({index+1}-{end} of {total_items})")
         print(f"{'Série':<{title_width}} {'Progress':<{bar_width+6}} {'Status':>{status_width}}")
         print(separator)
-        
         for series in series_list[index:end]:
             title = series['title'][:title_width-2]  # Truncate long names
             progress_bar = create_progress_bar(series['completion'], width=bar_width)
             percent = series['completion']
             watched = series['watched_episodes']
             total = series['total_episodes']
-            
             # Status indicator
             if series['is_incomplete']:
                 status = f"⚠️ {percent}%"
@@ -186,9 +225,7 @@ def show_series_with_progress():
             else:
                 status = f"✓ 100%"
                 watched_info = f"({watched}/{total})"
-            
             print(f"{title:<{title_width}} {progress_bar} {watched_info:>7}  {status:>{status_width}}")
-        
         print(separator)
         index = end
         page_num += 1
@@ -196,7 +233,10 @@ def show_series_with_progress():
             cont = input("More? (Enter = next, q = stop): ").strip().lower()
             if cont == 'q':
                 break
-    
+        if page_num > max_pages:
+            print("\n✗ Too many pages, stopping pagination.")
+            break
+
     print(f"\nTotal: {total_items} series")
     incomplete_series = [s for s in series_list if s['is_incomplete']]
     incomplete = len(incomplete_series)
@@ -227,10 +267,13 @@ def show_series_with_progress():
                     if scraper.series_data:
                         if confirm_and_save_changes(scraper.series_data, f"Rescrape data ({len(urls)} series)"):
                             print(f"\n✓ Rescrape completed! {len(urls)} series updated.")
+                            logger.info(f"Rescraped {len(urls)} incomplete series")
                     else:
                         print("\n⚠ No data scraped")
+                        logger.warning("No data scraped during rescrape operation")
                 except Exception as e:
                     print(f"\n✗ Rescrape failed: {str(e)}")
+                    logger.error(f"Rescrape failed: {e}")
             else:
                 print("✗ Could not find URLs for incomplete series")
     else:
@@ -291,28 +334,72 @@ def generate_report():
                             f.write('\n'.join(urls) + '\n')
                         print(f"\n✓ Exported {len(urls)} URLs to series_urls.txt")
                         print(f"  → Use option 6 (Batch add) to rescrape these series")
+                        logger.info(f"Exported {len(urls)} URLs to series_urls.txt")
                     else:
                         print("\n⚠ Could not extract URLs from ongoing series")
+                        logger.warning("Could not extract URLs from ongoing series for export")
                 except Exception as e:
                     print(f"\n✗ Failed to export URLs: {str(e)}")
+                    logger.error(f"Failed to export URLs: {e}")
         
     except Exception as e:
         print(f"\n✗ Failed to generate report: {str(e)}")
+        logger.error(f"Failed to generate report: {e}")
 
 
 def add_series_by_url():
     """Add a single series to the index by pasting its URL"""
     print("\n→ Add single series by URL")
     print("  Example: https://bs.to/serie/Breaking-Bad\n")
-    url = input("Enter series URL: ").strip()
     
-    if not url:
-        print("✗ No URL provided")
-        return
-    
-    if not url.startswith("http"):
-        print("✗ Invalid URL (must start with http:// or https://)")
-        return
+    while True:
+        url = input("Enter series URL: ").strip()
+        
+        # Validate URL format
+        if not url:
+            print("✗ No URL provided")
+            continue
+            
+        if not url.startswith(("http://", "https://")):
+            print("✗ Invalid URL (must start with http:// or https://)")
+            continue
+            
+        # Parse and validate URL structure
+        try:
+            parsed_url = urlparse(url)
+            if not parsed_url.netloc or 'bs.to' not in parsed_url.netloc:
+                print("✗ Invalid bs.to URL")
+                continue
+        except Exception as e:
+            print("✗ Invalid URL format")
+            logger.error(f"Invalid URL format: {url}, error: {e}")
+            continue
+            
+        break
+        import re
+        while True:
+            url = input("Enter series URL: ").strip()
+            # Validate URL format
+            if not url:
+                print("✗ No URL provided")
+                continue
+            if not url.startswith(("http://", "https://")):
+                print("✗ Invalid URL (must start with http:// or https://)")
+                continue
+            try:
+                parsed_url = urlparse(url)
+                if not parsed_url.netloc or 'bs.to' not in parsed_url.netloc:
+                    print("✗ Invalid bs.to URL")
+                    continue
+                # Require /serie/ in path
+                if not re.search(r"/serie/[^/]+", parsed_url.path):
+                    print("✗ URL must be a valid bs.to series page (e.g. https://bs.to/serie/Breaking-Bad)")
+                    continue
+            except Exception as e:
+                print("✗ Invalid URL format")
+                logger.error(f"Invalid URL format: {url}, error: {e}")
+                continue
+            break
     
     print("\n→ Starting scraper for single series...")
     print("  (Browser will open - do not close it manually)\n")
@@ -324,11 +411,45 @@ def add_series_by_url():
         # Use scraped data directly from scraper and confirm before saving
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Series data"):
+                # Print watched/total episodes for the updated series
+                series = None
+                # scraper.series_data may be a list or dict
+                if isinstance(scraper.series_data, list):
+                    for s in scraper.series_data:
+                        if s.get('url') == url or s.get('link') == url:
+                            series = s
+                            break
+                    if not series and len(scraper.series_data) == 1:
+                        series = scraper.series_data[0]
+                elif isinstance(scraper.series_data, dict):
+                    # Try to find by url or just take the first
+                    for s in scraper.series_data.values():
+                        if s.get('url') == url or s.get('link') == url:
+                            series = s
+                            break
+                    if not series:
+                        series = next(iter(scraper.series_data.values()))
+
+                if series:
+                    watched = series.get('watched_episodes', 0)
+                    total = series.get('total_episodes', 0)
+                    percent = round((watched / total * 100), 1) if total else 0
+                    print(f"\nStatus for '{series.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
                 print("\n✓ Series added/updated successfully!")
+                logger.info(f"Successfully added/updated series: {url}")
         else:
             print("\n⚠ No data scraped")
+            logger.warning(f"No data scraped for URL: {url}")
+    except RequestException as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error adding series from URL {url}: {e}")
+    except KeyboardInterrupt:
+        print("\n⚠ Series addition interrupted by user")
+        logger.info(f"Series addition interrupted for URL: {url}")
     except Exception as e:
         print(f"\n✗ Failed to add series: {str(e)}")
+    # (Removed duplicate, incorrectly indented block)
+        logger.error(f"Failed to add series from URL {url}: {e}")
 
 
 def batch_add_series_from_file():
@@ -356,6 +477,7 @@ def batch_add_series_from_file():
             urls = [line.strip() for line in f if line.strip() and line.strip().startswith('http')]
     except Exception as e:
         print(f"✗ Failed to read file: {str(e)}")
+        logger.error(f"Failed to read file {file_path}: {e}")
         return
     
     if not urls:
@@ -383,10 +505,19 @@ def batch_add_series_from_file():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, f"Batch data ({len(urls)} series)"):
                 print(f"\n✓ Batch add completed! {len(urls)} series processed.")
+                logger.info(f"Batch add completed: {len(urls)} series processed")
         else:
             print("\n⚠ No data scraped")
+            logger.warning("No data scraped during batch processing")
+    except RequestException as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error in batch processing: {e}")
+    except KeyboardInterrupt:
+        print("\n⚠ Batch processing interrupted by user")
+        logger.info("Batch processing interrupted by user")
     except Exception as e:
         print(f"\n✗ Batch add failed: {str(e)}")
+        logger.error(f"Batch add failed: {e}")
 
 
 def retry_failed_series():
@@ -395,23 +526,30 @@ def retry_failed_series():
     print("  (Browser will open - do not close it manually)\n")
     
     # Pre-check for failed series before launching browser
-    from src.scraper import BsToScraper
-    scraper = BsToScraper()
-    failed_list = scraper.load_failed_series()
-    if not failed_list:
-        print("✓ No failed series found. Nothing to retry.")
-        return
-    print(f"✓ Found {len(failed_list)} failed series from last run")
     try:
+        from src.scraper import BsToScraper
+        scraper = BsToScraper()
+        failed_list = scraper.load_failed_series()
+        if not failed_list:
+            print("✓ No failed series found. Nothing to retry.")
+            return
+        print(f"✓ Found {len(failed_list)} failed series from last run")
+        
         scraper.run(SERIES_INDEX_FILE, retry_failed=True)
         # Use scraped data directly from scraper and confirm before saving
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Retry data"):
                 print("\n✓ Retry completed successfully!")
+                logger.info(f"Retry completed successfully for {len(failed_list)} series")
         else:
             print("\n⚠ No data to retry")
+            logger.warning("No data to retry in retry_failed_series")
+    except RequestException as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error in retry_failed_series: {e}")
     except Exception as e:
         print(f"\n✗ Retry failed: {str(e)}")
+        logger.error(f"Retry failed: {e}")
 
 
 def pause_scraping():
@@ -421,12 +559,14 @@ def pause_scraping():
         with open(pause_file, 'w', encoding='utf-8') as f:
             f.write('PAUSE')
         print(f"\n✓ Pause file created: {pause_file}\nWorkers will pause at next checkpoint.")
+        logger.info(f"Pause file created: {pause_file}")
     except Exception as e:
         print(f"\n✗ Failed to create pause file: {str(e)}")
+        logger.error(f"Failed to create pause file {pause_file}: {e}")
 
 def show_active_workers():
     """Display active worker processes"""
-    worker_pids_file = os.path.join(os.path.dirname(__file__), 'data', '.worker_pids.json')
+    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
     
     if not os.path.exists(worker_pids_file):
         print("\n✓ No active workers found\n")
@@ -463,19 +603,23 @@ def show_active_workers():
                         subprocess.run(['kill', '-9', str(pid)], 
                                      capture_output=True, check=False)
                     killed_count += 1
-                except Exception:
+                except Exception as e:
+                    logger.error(f"Failed to kill worker {worker_id} (PID {pid}): {e}")
                     pass
             
             # Clean up the PID file
             try:
                 os.remove(worker_pids_file)
                 print(f"✓ Killed {killed_count} worker(s) and cleaned up tracking file\n")
-            except Exception:
+                logger.info(f"Killed {killed_count} workers and cleaned up tracking file")
+            except Exception as e:
                 print(f"✓ Killed {killed_count} worker(s)\n")
+                logger.error(f"Failed to clean up worker PIDs file: {e}")
         else:
             print("✓ Workers left running\n")
     except Exception as e:
-        print(f"\n✗ Error reading workers: {str(e)}\n")
+        print(f"\n✗ Error reading workers: {str(e)}")
+        logger.error(f"Error reading workers from file {worker_pids_file}: {e}")
 
 
 def main():
