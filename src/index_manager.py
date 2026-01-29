@@ -1,10 +1,23 @@
+
 import json
 import os
 from datetime import datetime
 import sys
+import logging
+
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import SERIES_INDEX_FILE, DATA_DIR
+
+# Setup logging
+LOG_FILE = os.path.join(DATA_DIR, 'index_manager.log')
+os.makedirs(DATA_DIR, exist_ok=True)
+logging.basicConfig(
+    filename=LOG_FILE,
+    level=logging.INFO,
+    format='%(asctime)s %(levelname)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
 
 def paginate_list(items, formatter, page_size=20):
@@ -269,28 +282,36 @@ def confirm_and_save_changes(new_data, description="data"):
     Returns:
         True if saved, False if cancelled
     """
-    # Load existing data
-    old_data = {}
+
+    # Load current index as old_data
     if os.path.exists(SERIES_INDEX_FILE):
         try:
             with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
-                old_list = json.load(f)
-            old_data = {s.get('title'): s for s in old_list}
+                old_data = json.load(f)
+            logging.info(f"Loaded index from {SERIES_INDEX_FILE} ({len(old_data)} entries)")
         except Exception as e:
-            print(f"  ⚠ Could not load existing data: {str(e)}")
-    
-    # Convert new_data to dict if needed
+            print(f"⚠ Error loading index: {str(e)}")
+            logging.error(f"Error loading index: {str(e)}")
+            old_data = []
+    else:
+        old_data = []
+        logging.info(f"No existing index found at {SERIES_INDEX_FILE}")
+
+    # Convert new_data to dict for merging
     if isinstance(new_data, list):
         new_dict = {s.get('title'): s for s in new_data}
     else:
         new_dict = new_data
-    
+
+    changes = print_changes(old_data, new_dict)
+    logging.info(f"Detected changes: { {k: len(v) for k,v in changes.items()} }")
 
     # Require manual confirmation for ALL changes (watched and unwatched)
     allow_watched = False
     allow_unwatched = False
     # Confirm watched (unwatched→watched)
     if changes["newly_watched"]:
+        logging.info(f"Prompting user to confirm marking {len(changes['newly_watched'])} episodes as watched.")
         print(f"\n✅ {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
         print("   (manual confirmation required for all watched changes)")
         print("\n" + "-"*70)
@@ -304,11 +325,14 @@ def confirm_and_save_changes(new_data, description="data"):
         watched_response = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
         if watched_response == 'y':
             allow_watched = True
+            logging.info("User allowed watched changes.")
         else:
             print("  → Watched changes will be ignored (episodes stay unwatched)")
+            logging.info("User denied watched changes.")
 
     # Confirm unwatched (watched→unwatched)
     if changes["newly_unwatched"]:
+        logging.info(f"Prompting user to confirm marking {len(changes['newly_unwatched'])} episodes as unwatched.")
         print(f"\n⚠️  {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
         print("   (manual confirmation required for all unwatched changes)")
         print("\n" + "-"*70)
@@ -322,17 +346,23 @@ def confirm_and_save_changes(new_data, description="data"):
         unwatch_response = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
         if unwatch_response == 'y':
             allow_unwatched = True
+            logging.info("User allowed unwatched changes.")
         else:
             print("  → Unwatched changes will be ignored (episodes stay watched)")
+            logging.info("User denied unwatched changes.")
 
     # Remove changes not allowed
     if not allow_watched:
         changes["newly_watched"] = []
     if not allow_unwatched:
         changes["newly_unwatched"] = []
-    
+
     # Build merged data (preserve old entries, merge with new)
-    merged = dict(old_data)
+    # Ensure old_data is a dict (convert from list if needed)
+    if isinstance(old_data, list):
+        merged = {s.get('title'): s for s in old_data}
+    else:
+        merged = dict(old_data)
     for title, new_entry in new_dict.items():
         if title in merged:
             # Merge: only apply watched/unwatched changes if allowed
@@ -373,96 +403,78 @@ def confirm_and_save_changes(new_data, description="data"):
             new_entry['added_date'] = datetime.now().isoformat()
             new_entry['status'] = 'active'
             merged[title] = new_entry
-    
     # Show final changes summary (excluding unwatched if not allowed)
     main_changes = sum(len(v) for k, v in changes.items() if k != 'newly_unwatched')
     if allow_unwatched:
         main_changes += len(changes['newly_unwatched'])
-    
     if main_changes == 0:
         print(f"\n✓ {description} already up to date.")
+        logging.info(f"No changes to save for {description}.")
         return True
-    
     # Display changes (without unwatched section, already handled above)
     display_changes(changes, include_unwatched=False, new_data=new_dict)
-    
     # Ask for confirmation
     response = input(f"\nSave these changes? (y/n): ").strip().lower()
     if response != 'y':
         print("✗ Changes discarded. Nothing saved.")
+        logging.info("User discarded changes. Nothing saved.")
         return False
-    
     # Save merged data
     try:
         series_list = list(merged.values())
         with open(SERIES_INDEX_FILE, 'w', encoding='utf-8') as f:
             json.dump(series_list, f, indent=2, ensure_ascii=False)
         print(f"✓ Saved {len(series_list)} series to index")
+        logging.info(f"Saved {len(series_list)} series to {SERIES_INDEX_FILE}")
         return True
     except Exception as e:
         print(f"✗ Failed to save: {str(e)}")
+        logging.error(f"Failed to save index: {str(e)}")
         return False
-
-
 class IndexManager:
     def __init__(self):
         self.series_index = {}
         self.ensure_data_dir()
         self.load_index()
-        
+
     def ensure_data_dir(self):
-        """Create data directory if it doesn't exist"""
         os.makedirs(DATA_DIR, exist_ok=True)
-        
+
     def load_index(self):
-        """Load existing series index"""
         if os.path.exists(SERIES_INDEX_FILE):
             try:
                 with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                
-                # Convert list format to dict format if needed
                 if isinstance(data, list):
-                    # Old format: list of series with 'title' key
                     self.series_index = {item.get("title"): item for item in data}
                 else:
-                    # Already dict format
                     self.series_index = data
-                
                 print(f"✓ Loaded {len(self.series_index)} series from index")
+                logging.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
             except Exception as e:
                 print(f"⚠ Error loading index: {str(e)}")
+                logging.error(f"Error loading index: {str(e)}")
                 self.series_index = {}
-                
+
     def create_index_from_scraped_data(self, scraped_series):
-        """Create index from scraped data - updates episode data for existing series"""
         print(f"→ Creating index from {len(scraped_series)} series...")
-        
         new_series = 0
         updated_series = 0
-        
         for series in scraped_series:
             title = series.get("title", "Unknown")
-            
             if title not in self.series_index:
-                # New series: use all data from scraper
                 new_series += 1
                 series["added_date"] = datetime.now().isoformat()
                 self.series_index[title] = series
             else:
-                # Existing series: merge new episode data, preserve added_date
                 updated_series += 1
                 old_added_date = self.series_index[title].get("added_date")
                 series["last_updated"] = datetime.now().isoformat()
                 if old_added_date:
                     series["added_date"] = old_added_date
                 self.series_index[title] = series
-                
-        print(f"✓ Index created: {new_series} new, {updated_series} updated")
-        return self.series_index
-        
+
     def get_statistics(self):
-        """Compute stats based on episode progress (no separate watched list)"""
         series_with_progress = self.get_series_with_progress()
         total = len(series_with_progress)
         watched = sum(1 for s in series_with_progress if not s['is_incomplete'])
@@ -485,9 +497,10 @@ class IndexManager:
             with open(SERIES_INDEX_FILE, 'w', encoding='utf-8') as f:
                 json.dump(series_list, f, indent=2, ensure_ascii=False)
             print(f"✓ Saved series index ({len(self.series_index)} entries)")
+            logging.info(f"Saved series index ({len(self.series_index)} entries) to {SERIES_INDEX_FILE}")
         except Exception as e:
             print(f"✗ Failed to save index: {str(e)}")
-            
+            logging.error(f"Failed to save index: {str(e)}")
 
             
     def save_all(self):
