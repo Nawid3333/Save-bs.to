@@ -27,7 +27,7 @@ from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIE
 
 # Performance settings
 # Allow overriding worker count via environment variable BS_MAX_WORKERS
-MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "6"))
+MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))
 USE_PARALLEL = True
 
 
@@ -91,7 +91,7 @@ class BsToScraper:
         self.auth_cookies = []
         self.checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
         self.failed_file = os.path.join(DATA_DIR, '.failed_series.json')
-        self.pause_file = os.path.join(DATA_DIR, '.scrape_pause')
+        self.pause_file = os.path.join(DATA_DIR, '.pause_scraping')
         self.worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
         self.completed_links = set()
         self.failed_links = []
@@ -1062,13 +1062,16 @@ class BsToScraper:
                 if do_health_check:
                     tasks_since_check = 0
                     try:
-                        driver.get(self.get_site_url())
+                        # Check login status on the current page first
                         if not self.is_logged_in(driver):
-                            try:
-                                self._login_with_driver(driver)
-                                error_streak = 0
-                            except Exception:
-                                error_streak += 1
+                            # Only reload main page if not logged in
+                            driver.get(self.get_site_url())
+                            if not self.is_logged_in(driver):
+                                try:
+                                    self._login_with_driver(driver)
+                                    error_streak = 0
+                                except Exception:
+                                    error_streak += 1
                     except Exception:
                         error_streak += 1
 

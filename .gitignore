@@ -50,7 +50,7 @@ data/*.json
 series_urls.txt
 
 # Scraper pause/worker files
-/data/.scrape_pause
+/data/.pause_scraping
 /data/.worker_pids.json
 
 # Personal data files

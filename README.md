@@ -96,7 +96,7 @@ Ctrl+C is unreliable for stopping parallel scrapes. Use the pause mechanism inst
 **Option B: Manual pause (any terminal)**
 
 ```powershell
-New-Item -Path "data\.scrape_pause" -Force
+New-Item -Path "data\.pause_scraping" -Force
 ```
 
 The scraping job will detect this file and pause at the next checkpoint.
