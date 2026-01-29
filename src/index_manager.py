@@ -285,71 +285,60 @@ def confirm_and_save_changes(new_data, description="data"):
     else:
         new_dict = new_data
     
-    # Detect changes BEFORE merging (to see what site says)
-    changes = print_changes(old_data, new_dict)
-    
-    # Check if there are any unwatched changes that need separate confirmation
-    allow_unwatched = False
-    if changes["newly_unwatched"]:
-        # Group unwatched changes by series and calculate watch percentage
-        series_unwatched = {}
-        for title, season, ep_num, watched_count, total_count in changes["newly_unwatched"]:
-            if title not in series_unwatched:
-                series_unwatched[title] = {
-                    'changes': [],
-                    'watched_count': watched_count,
-                    'total_count': total_count
-                }
-            series_unwatched[title]['changes'].append((season, ep_num))
-        
-        # Separate series into those requiring confirmation and those auto-approved
-        requires_confirmation = []
-        auto_approved = []  # No auto-approve anymore
-        
-        for title, info in series_unwatched.items():
-            requires_confirmation.extend([(title, s, e, info['watched_count'], info['total_count']) 
-                                          for s, e in info['changes']])
-            
-        if requires_confirmation:
-            print(f"\n⚠️  {len(requires_confirmation)} episode(s) would change from WATCHED to UNWATCHED")
-            print("   (manual confirmation required for all unwatched changes)")
-            print("\n" + "-"*70)
-            # Group by season for easier review
-            from collections import defaultdict
-            grouped = defaultdict(list)
-            for x in requires_confirmation:
-                grouped[(x[0], x[1], x[3], x[4])].append(x[2])  # (title, season, watched_count, total_count): [ep_num]
-            for (title, season, watched_count, total_count), ep_nums in grouped.items():
-                if len(ep_nums) == total_count:
-                    print(f"  ⚠ {title} [{season}]: {len(ep_nums)}/{total_count} episodes (currently {watched_count}/{total_count} watched, {watched_count/total_count*100:.0f}%)")
-                else:
-                    for ep_num in sorted(ep_nums):
-                        print(f"  ⚠ {title} {format_season_ep(season, ep_num)} (currently {watched_count}/{total_count} watched, {watched_count/total_count*100:.0f}%)")
-            print("-"*70)
-            unwatch_response = input("\nAllow these episodes to be UNWATCHED? (y/n): ").strip().lower()
-            if unwatch_response == 'y':
-                allow_unwatched = True
-            else:
-                print("  → Unwatched changes will be ignored (episodes stay watched)")
-        else:
-            allow_unwatched = False
 
-        # Update changes list to only include episodes being unwatched
-        if not allow_unwatched:
-            changes["newly_unwatched"] = []
-        elif requires_confirmation and unwatch_response != 'y':
-            # Keep only auto-approved changes
-            changes["newly_unwatched"] = auto_approved
+    # Require manual confirmation for ALL changes (watched and unwatched)
+    allow_watched = False
+    allow_unwatched = False
+    # Confirm watched (unwatched→watched)
+    if changes["newly_watched"]:
+        print(f"\n✅ {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
+        print("   (manual confirmation required for all watched changes)")
+        print("\n" + "-"*70)
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for x in changes["newly_watched"]:
+            grouped[(x[0], x[1])].append(x[2])
+        for (title, season), ep_nums in grouped.items():
+            print(f"  ✓ {title} [{season}]: {len(ep_nums)} episode(s)")
+        print("-"*70)
+        watched_response = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
+        if watched_response == 'y':
+            allow_watched = True
+        else:
+            print("  → Watched changes will be ignored (episodes stay unwatched)")
+
+    # Confirm unwatched (watched→unwatched)
+    if changes["newly_unwatched"]:
+        print(f"\n⚠️  {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
+        print("   (manual confirmation required for all unwatched changes)")
+        print("\n" + "-"*70)
+        from collections import defaultdict
+        grouped = defaultdict(list)
+        for x in changes["newly_unwatched"]:
+            grouped[(x[0], x[1])].append(x[2])
+        for (title, season), ep_nums in grouped.items():
+            print(f"  ⚠ {title} [{season}]: {len(ep_nums)} episode(s)")
+        print("-"*70)
+        unwatch_response = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
+        if unwatch_response == 'y':
+            allow_unwatched = True
+        else:
+            print("  → Unwatched changes will be ignored (episodes stay watched)")
+
+    # Remove changes not allowed
+    if not allow_watched:
+        changes["newly_watched"] = []
+    if not allow_unwatched:
+        changes["newly_unwatched"] = []
     
     # Build merged data (preserve old entries, merge with new)
     merged = dict(old_data)
     for title, new_entry in new_dict.items():
         if title in merged:
-            # Merge: preserve watched status unless explicitly allowed to unwatch
+            # Merge: only apply watched/unwatched changes if allowed
             old_entry = merged[title]
             old_entry['status'] = 'active'
             old_seasons = {s.get('season'): s for s in old_entry.get('seasons', [])}
-            
             for new_season in new_entry.get('seasons', []):
                 season_label = new_season.get('season')
                 if season_label in old_seasons:
@@ -360,17 +349,17 @@ def confirm_and_save_changes(new_data, description="data"):
                         if ep_num in old_eps:
                             old_watched = old_eps[ep_num].get('watched', False)
                             new_watched = new_ep.get('watched', False)
-                            if allow_unwatched:
-                                # Use the new value (allow unwatching)
-                                new_ep['watched'] = new_watched
+                            # Only allow watched/unwatched changes if confirmed
+                            if allow_watched and (not old_watched and new_watched):
+                                new_ep['watched'] = True
+                            elif allow_unwatched and (old_watched and not new_watched):
+                                new_ep['watched'] = False
                             else:
-                                # Preserve watched (once watched = always watched)
-                                new_ep['watched'] = old_watched or new_watched
+                                new_ep['watched'] = old_watched
                         merged_episodes.append(new_ep)
                     old_seasons[season_label]['episodes'] = merged_episodes
                 else:
                     old_seasons[season_label] = new_season
-            
             old_entry['seasons'] = list(old_seasons.values())
             old_entry['watched_episodes'] = sum(
                 sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
