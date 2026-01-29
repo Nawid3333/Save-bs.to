@@ -184,26 +184,71 @@ def display_changes(changes, include_unwatched=True, new_data=None):
 
     if changes["newly_watched"]:
         if new_data:
-            grouped_lines = group_episodes_by_season(changes["newly_watched"], new_data)
+            # Group by season and summarize fully watched
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for title, season, ep_num in changes["newly_watched"]:
+                grouped[(title, season)].append(ep_num)
             print(f"\n✅ NEWLY WATCHED ({len(changes['newly_watched'])} episodes)")
-            for line in grouped_lines:
-                print(line)
+            for (title, season), ep_nums in grouped.items():
+                # Find total episodes in this season
+                series = None
+                if isinstance(new_data, list):
+                    for s in new_data:
+                        if s.get('title') == title:
+                            series = s
+                            break
+                else:
+                    series = new_data.get(title)
+                total_in_season = 0
+                if series:
+                    for s in series.get('seasons', []):
+                        if s.get('season') == season:
+                            total_in_season = len(s.get('episodes', []))
+                            break
+                count = len(ep_nums)
+                if total_in_season > 0 and count == total_in_season:
+                    print(f"  ✓ {title} [{season}]: {count}/{total_in_season} episodes (100%)")
+                else:
+                    for ep_num in sorted(ep_nums):
+                        print(f"  ✓ {title} [{season}] Ep {ep_num}")
         else:
             print(f"\n✅ NEWLY WATCHED ({len(changes['newly_watched'])}) [ungrouped fallback]")
             for x in changes["newly_watched"]:
                 print(f"  ✓ {x[0]} [{x[1]}] Ep {x[2]}")
 
-    if include_unwatched and changes.get("newly_unwatched"):
+    # Always show what the site reports as unwatched, even if not allowed
+    if changes.get("newly_unwatched"):
         if new_data:
-            grouped_lines = group_episodes_by_season(
-                [(x[0], x[1], x[2]) for x in changes["newly_unwatched"]], 
-                new_data
-            )
-            print(f"\n⚠️  WOULD BE UNWATCHED ({len(changes['newly_unwatched'])} episodes)")
-            for line in grouped_lines:
-                print(line)
+            from collections import defaultdict
+            grouped = defaultdict(list)
+            for x in changes["newly_unwatched"]:
+                grouped[(x[0], x[1])].append(x[2])
+            print(f"\n⚠️  SITE REPORTS UNWATCHED ({len(changes['newly_unwatched'])} episodes)")
+            for (title, season), ep_nums in grouped.items():
+                # Find total episodes in this season
+                series = None
+                if isinstance(new_data, list):
+                    for s in new_data:
+                        if s.get('title') == title:
+                            series = s
+                            break
+                else:
+                    series = new_data.get(title)
+                total_in_season = 0
+                if series:
+                    for s in series.get('seasons', []):
+                        if s.get('season') == season:
+                            total_in_season = len(s.get('episodes', []))
+                            break
+                count = len(ep_nums)
+                if total_in_season > 0 and count == total_in_season:
+                    print(f"  ⚠ {title} [{season}]: {count}/{total_in_season} episodes (100%)")
+                else:
+                    for ep_num in sorted(ep_nums):
+                        print(f"  ⚠ {title} [{season}] Ep {ep_num}")
         else:
-            print(f"\n⚠️  WOULD BE UNWATCHED ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
+            print(f"\n⚠️  SITE REPORTS UNWATCHED ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
             for x in changes["newly_unwatched"]:
                 print(f"  ⚠ {x[0]} [{x[1]}] Ep {x[2]}")
     
