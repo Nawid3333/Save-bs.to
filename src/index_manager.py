@@ -581,8 +581,10 @@ class IndexManager:
 
     def get_statistics(self):
         series_with_progress = self.get_series_with_progress()
+        if not series_with_progress:
+            series_with_progress = []
         total = len(series_with_progress)
-        watched = sum(1 for s in series_with_progress if not s['is_incomplete'])
+        watched = sum(1 for s in series_with_progress if not s.get('is_incomplete'))
         unwatched = total - watched
         empty_count = len([s for s in self.series_index.values() if s.get('empty', False)])
 
@@ -615,13 +617,15 @@ class IndexManager:
     def get_full_report(self):
         """Generate a full report of all series including ongoing/started"""
         series_progress = self.get_series_with_progress()
-        watched_titles = [s['title'] for s in series_progress if not s['is_incomplete']]
-        ongoing_series = [s for s in series_progress if s['is_incomplete'] and s['watched_episodes'] > 0]
-        not_started = [s for s in series_progress if s['is_incomplete'] and s['watched_episodes'] == 0]
-        
+        if not series_progress:
+            series_progress = []
+        watched_titles = [s['title'] for s in series_progress if not s.get('is_incomplete')]
+        ongoing_series = [s for s in series_progress if s.get('is_incomplete') and s.get('watched_episodes', 0) > 0]
+        not_started = [s for s in series_progress if s.get('is_incomplete') and s.get('watched_episodes', 0) == 0]
+
         # Sort ongoing by completion % (descending)
-        ongoing_titles = sorted([s['title'] for s in ongoing_series], 
-                               key=lambda x: next((s['completion'] for s in ongoing_series if s['title'] == x), 0), 
+        ongoing_titles = sorted([s['title'] for s in ongoing_series],
+                               key=lambda x: next((s.get('completion', 0) for s in ongoing_series if s.get('title') == x), 0),
                                reverse=True)
         not_started_titles = sorted([s['title'] for s in not_started])
 
@@ -640,6 +644,34 @@ class IndexManager:
     def get_series_with_progress(self, sort_by='completion', reverse=False):
         """
         Get series with episode progress information
-        
-        Args:
+        Returns a list of dicts, each with progress fields.
         """
+        series_list = []
+        for title, series in self.series_index.items():
+            total_episodes = 0
+            watched_episodes = 0
+            is_incomplete = False
+            for season in series.get('seasons', []):
+                eps = season.get('episodes', [])
+                total_episodes += len(eps)
+                watched_episodes += sum(1 for ep in eps if ep.get('watched', False))
+            is_incomplete = watched_episodes < total_episodes if total_episodes > 0 else True
+            completion = round((watched_episodes / total_episodes * 100), 1) if total_episodes > 0 else 0.0
+            entry = dict(series)
+            entry['watched_episodes'] = watched_episodes
+            entry['total_episodes'] = total_episodes
+            entry['is_incomplete'] = is_incomplete
+            entry['completion'] = completion
+            series_list.append(entry)
+        # Sorting
+        if sort_by == 'completion':
+            series_list.sort(key=lambda s: (s['is_incomplete'], s['completion']), reverse=reverse)
+        elif sort_by == 'name':
+            series_list.sort(key=lambda s: s.get('title', '').lower(), reverse=reverse)
+        elif sort_by == 'date':
+            series_list.sort(key=lambda s: s.get('added_date', ''), reverse=reverse)
+        elif sort_by == 'total_episodes':
+            series_list.sort(key=lambda s: s.get('total_episodes', 0), reverse=reverse)
+        elif sort_by == 'total_episodes_desc':
+            series_list.sort(key=lambda s: s.get('total_episodes', 0), reverse=not reverse)
+        return series_list
