@@ -19,6 +19,7 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 import atexit
+import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
@@ -1473,15 +1474,29 @@ class BsToScraper:
     
     def load_existing_links(self):
         """Load existing series links to avoid re-scraping"""
+        def normalize_link(link):
+            if not link:
+                return ''
+            link = link.strip().lower()
+            if not link.startswith('/'):
+                link = '/' + link
+            # Remove season/episode suffix: /serie/Name/1/de -> /serie/Name
+            return re.sub(r'/\d+(/de)?$', '', link)
         existing = set()
         try:
             if os.path.exists(SERIES_INDEX_FILE):
                 with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 for item in data or []:
-                    link = item.get('link')
-                    if link:
-                        existing.add(link)
+                    # Check all link variations if present
+                    variations = item.get('link_variations')
+                    if variations and isinstance(variations, list):
+                        for v in variations:
+                            existing.add(normalize_link(v))
+                    else:
+                        link = item.get('link')
+                        if link:
+                            existing.add(normalize_link(link))
         except Exception:
             pass
         return existing
@@ -1490,9 +1505,24 @@ class BsToScraper:
         """Scrape only new series not in index"""
         all_series = self.get_all_series()
         existing_links = self.load_existing_links()
-        new_series_list = [s for s in all_series if s.get('link') not in existing_links]
+        def normalize_link(link):
+            if not link:
+                return ''
+            link = link.strip().lower()
+            if not link.startswith('/'):
+                link = '/' + link
+            # Remove season/episode suffix: /serie/Name/1/de -> /serie/Name
+            return re.sub(r'/\d+(/de)?$', '', link)
+        filtered_series = [s for s in all_series if normalize_link(s.get('link')) not in existing_links]
 
-        print(f"→ New series to scrape: {len(new_series_list)} (out of {len(all_series)})")
+        print(f"→ New series to scrape: {len(filtered_series)} (out of {len(all_series)})")
+        self.series_data = []
+        if not filtered_series:
+            print("✓ No new series detected — skipping scraper spin-up")
+            return
+
+        # Run sequential to avoid extra workers for the small delta set
+        self._scrape_series_sequential(filtered_series)
         self.series_data = []
         if not new_series_list:
             print("✓ No new series detected — skipping scraper spin-up")

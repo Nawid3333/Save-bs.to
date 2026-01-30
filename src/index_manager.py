@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 import sys
 import logging
+import re
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -565,8 +566,28 @@ class IndexManager:
         print(f"→ Creating index from {len(scraped_series)} series...")
         new_series = 0
         updated_series = 0
+        def canonical_link(link):
+            if not link:
+                return ''
+            link = link.strip().lower()
+            if not link.startswith('/'):
+                link = '/' + link
+            # Remove season/episode suffix: /serie/Name/1/de -> /serie/Name
+            return re.sub(r'/\d+(/de)?$', '', link)
         for series in scraped_series:
             title = series.get("title", "Unknown")
+            # Always set the main canonical link
+            main_link = canonical_link(series.get("link"))
+            series["link"] = main_link
+            # Optionally, add a list of variations if needed
+            variations = set()
+            variations.add(main_link)
+            # Add all season links as variations
+            for season in series.get('seasons', []):
+                s_link = canonical_link(season.get('url', ''))
+                if s_link:
+                    variations.add(s_link)
+            series["link_variations"] = list(variations)
             if title not in self.series_index:
                 new_series += 1
                 series["added_date"] = datetime.now().isoformat()
