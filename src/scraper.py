@@ -7,6 +7,7 @@ import time
 import random
 import json
 import os
+import threading
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -17,10 +18,7 @@ import sys
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
-import threading
 import atexit
-import signal
-import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
@@ -230,28 +228,33 @@ class BsToScraper:
     # ==================== CHECKPOINT SYSTEM ====================
     
     def save_checkpoint(self):
-        """Save scraping checkpoint to resume later"""
+        """Save scraping checkpoint to resume later (as dict with 'completed_links')"""
         try:
             os.makedirs(DATA_DIR, exist_ok=True)
+            checkpoint_data = {'completed_links': list(self.completed_links)}
             with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(list(self.completed_links), f, ensure_ascii=False)
+                json.dump(checkpoint_data, f, ensure_ascii=False)
         except Exception:
             pass
     
     def load_checkpoint(self):
-        """Load checkpoint to resume from previous run"""
+        """Load checkpoint to resume from previous run (expects dict with 'completed_links')"""
         import json
         if not os.path.exists(self.checkpoint_file):
             return False
         try:
             with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            # Basic validation: must be a dict with expected keys
-            if not isinstance(data, dict) or 'series' not in data:
+            if isinstance(data, dict) and 'completed_links' in data:
+                self.completed_links = set(data.get('completed_links', []))
+                return True
+            elif isinstance(data, list):
+                # Backward compatibility: treat as list of completed links
+                self.completed_links = set(data)
+                return True
+            else:
                 print(f"✗ Checkpoint file is invalid or corrupted.")
                 return False
-            self.completed_links = set(data.get('completed_links', []))
-            return True
         except Exception as e:
             print(f"✗ Failed to load checkpoint: {e}")
             return False

@@ -8,6 +8,8 @@ import json
 import sys
 import os
 import logging
+import re
+import subprocess
 from requests.exceptions import RequestException
 from urllib.parse import urlparse
 
@@ -354,52 +356,27 @@ def add_series_by_url():
     
     while True:
         url = input("Enter series URL: ").strip()
-        
         # Validate URL format
         if not url:
             print("✗ No URL provided")
             continue
-            
         if not url.startswith(("http://", "https://")):
             print("✗ Invalid URL (must start with http:// or https://)")
             continue
-            
-        # Parse and validate URL structure
         try:
             parsed_url = urlparse(url)
             if not parsed_url.netloc or 'bs.to' not in parsed_url.netloc:
                 print("✗ Invalid bs.to URL")
                 continue
+            # Require /serie/ in path
+            if not re.search(r"/serie/[^/]+", parsed_url.path):
+                print("✗ URL must be a valid bs.to series page (e.g. https://bs.to/serie/Breaking-Bad)")
+                continue
         except Exception as e:
             print("✗ Invalid URL format")
             logger.error(f"Invalid URL format: {url}, error: {e}")
             continue
-            
         break
-        import re
-        while True:
-            url = input("Enter series URL: ").strip()
-            # Validate URL format
-            if not url:
-                print("✗ No URL provided")
-                continue
-            if not url.startswith(("http://", "https://")):
-                print("✗ Invalid URL (must start with http:// or https://)")
-                continue
-            try:
-                parsed_url = urlparse(url)
-                if not parsed_url.netloc or 'bs.to' not in parsed_url.netloc:
-                    print("✗ Invalid bs.to URL")
-                    continue
-                # Require /serie/ in path
-                if not re.search(r"/serie/[^/]+", parsed_url.path):
-                    print("✗ URL must be a valid bs.to series page (e.g. https://bs.to/serie/Breaking-Bad)")
-                    continue
-            except Exception as e:
-                print("✗ Invalid URL format")
-                logger.error(f"Invalid URL format: {url}, error: {e}")
-                continue
-            break
     
     print("\n→ Starting scraper for single series...")
     print("  (Browser will open - do not close it manually)\n")
@@ -407,7 +384,6 @@ def add_series_by_url():
     try:
         scraper = BsToScraper()
         scraper.run(SERIES_INDEX_FILE, single_url=url)
-        
         # Use scraped data directly from scraper and confirm before saving
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Series data"):
@@ -448,7 +424,6 @@ def add_series_by_url():
         logger.info(f"Series addition interrupted for URL: {url}")
     except Exception as e:
         print(f"\n✗ Failed to add series: {str(e)}")
-    # (Removed duplicate, incorrectly indented block)
         logger.error(f"Failed to add series from URL {url}: {e}")
 
 
@@ -575,24 +550,25 @@ def show_active_workers():
     try:
         with open(worker_pids_file, 'r', encoding='utf-8') as f:
             workers = json.load(f)
-        
-        if not workers:
+        if not isinstance(workers, dict) or not workers:
             print("\n✓ No active workers\n")
             return
-        
         print(f"\n📊 ACTIVE WORKERS ({len(workers)}):")
         print("ID | PID | Type")
         print("---|-----|------")
-        for worker_id, pid in sorted(workers.items(), key=lambda x: int(x[0])):
-            worker_type = "Main" if worker_id == "0" else f"Worker"
-            print(f"{worker_id:>2} | {pid} | {worker_type}")
+        try:
+            for worker_id, pid in sorted(workers.items(), key=lambda x: int(x[0])):
+                worker_type = "Main" if worker_id == "0" else f"Worker"
+                print(f"{worker_id:>2} | {pid} | {worker_type}")
+        except Exception as e:
+            print("✗ Error parsing worker PIDs. File may be corrupted.")
+            logger.error(f"Error parsing worker PIDs: {e}")
+            return
         print()
-        
         # Option to kill all workers
         kill_choice = input("Kill all workers? (y/n): ").strip().lower()
         if kill_choice == 'y':
             print("\n🔴 Killing all workers...")
-            import subprocess
             killed_count = 0
             for worker_id, pid in workers.items():
                 try:
@@ -605,8 +581,6 @@ def show_active_workers():
                     killed_count += 1
                 except Exception as e:
                     logger.error(f"Failed to kill worker {worker_id} (PID {pid}): {e}")
-                    pass
-            
             # Clean up the PID file
             try:
                 os.remove(worker_pids_file)
@@ -635,7 +609,9 @@ def main():
     while True:
         show_menu()
         choice = input("Enter your choice (1-10): ").strip()
-        
+        if not choice.isdigit() or not (1 <= int(choice) <= 10):
+            print("✗ Invalid choice. Please enter a number between 1 and 10.")
+            continue
         if choice == '1':
             scrape_series()
         elif choice == '2':
@@ -657,8 +633,6 @@ def main():
         elif choice == '10':
             print("\n✓ Goodbye!\n")
             break
-        else:
-            print("✗ Invalid choice. Please try again.")
 
 
 if __name__ == "__main__":
