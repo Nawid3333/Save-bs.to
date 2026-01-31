@@ -890,14 +890,11 @@ class BsToScraper:
                     eta_seconds = avg_time_per_series * remaining_series
                     eta_mins = int(eta_seconds / 60)
                     progress_pct = int((idx / len(all_series)) * 100)
-                    
                     # Progress bar
                     bar_length = 30
                     filled = int(bar_length * idx / len(all_series))
                     bar = '█' * filled + '░' * (bar_length - filled)
-                    
                     print(f"\n[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | {series['title']}")
-                    
                     result = self.process_series_page(series['url'], series_hint=series)
                     if result:
                         # Mark empty series
@@ -913,8 +910,10 @@ class BsToScraper:
                         self.save_checkpoint()
                     else:
                         print("  ⚠ Skipped (no data)")
+                        self.failed_links.append(series)
                 except Exception as e:
                     print(f"  ⚠ Error processing {series['title']}: {str(e)}")
+                    self.failed_links.append(series)
                     continue
         except KeyboardInterrupt:
             print("\n\n⚠ Scraping interrupted by user (Ctrl+C)")
