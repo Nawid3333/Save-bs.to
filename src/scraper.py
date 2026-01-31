@@ -696,85 +696,15 @@ class BsToScraper:
                     season_label, season_url = season_item
                     watched_status = "none"  # Unknown, needs loading
                     season_type = 'regular' if is_regular_season(season_label) else season_label
-                
+
                 try:
-                    cached_season = existing_seasons.get(season_label)
-                    
-                    # Parallel mode: if we've confirmed series is unwatched, skip grey REGULAR seasons
-                    # Special seasons (OVA, Movies, Specials) are always checked individually
-                    if parallel_mode and assume_grey_unwatched and watched_status == 'none' and season_type == 'regular':
-                        if cached_season and cached_season.get('episodes'):
-                            # Use cached episodes, mark all unwatched
-                            episodes = []
-                            for ep in cached_season['episodes']:
-                                episodes.append({
-                                    'number': ep.get('number', ''),
-                                    'title': ep.get('title', ''),
-                                    'watched': False
-                                })
-                            watched_count = 0
-                            total_count = len(episodes)
-                            skipped_seasons += 1
-                        else:
-                            # No cache but we assume unwatched - still need to load for episode list
-                            self.driver.get(season_url)
-                            self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
-                            season_html = self.driver.page_source
-                            episodes = self.scrape_episodes_from_html(season_html)
-                            # Force all unwatched (we know series is unwatched)
-                            for ep in episodes:
-                                ep['watched'] = False
-                            watched_count = 0
-                            total_count = len(episodes)
-                    # Optimization: use cached data if available and status is definitive
-                    elif cached_season and cached_season.get('episodes'):
-                        cached_eps = cached_season['episodes']
-                        
-                        if watched_status == 'full':
-                            # Season is fully watched (green) - use cached episodes, mark all watched
-                            episodes = []
-                            for ep in cached_eps:
-                                episodes.append({
-                                    'number': ep.get('number', ''),
-                                    'title': ep.get('title', ''),
-                                    'watched': True  # Override to watched
-                                })
-                            watched_count = len(episodes)
-                            total_count = len(episodes)
-                            skipped_seasons += 1
-                        elif watched_status == 'none' and cached_season.get('watched_episodes', 0) == 0:
-                            # Season is unwatched (grey) AND was unwatched before - use cached
-                            episodes = []
-                            for ep in cached_eps:
-                                episodes.append({
-                                    'number': ep.get('number', ''),
-                                    'title': ep.get('title', ''),
-                                    'watched': False  # Keep unwatched
-                                })
-                            watched_count = 0
-                            total_count = len(episodes)
-                            skipped_seasons += 1
-                        else:
-                            # Status unclear or partial - must load to check
-                            self.driver.get(season_url)
-                            self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
-                            season_html = self.driver.page_source
-                            episodes = self.scrape_episodes_from_html(season_html)
-                            watched_count = sum(1 for ep in episodes if ep['watched'])
-                            total_count = len(episodes)
-                    else:
-                        # No cached data - must load
-                        self.driver.get(season_url)
-                        self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
-                        season_html = self.driver.page_source
-                        episodes = self.scrape_episodes_from_html(season_html)
-                        watched_count = sum(1 for ep in episodes if ep['watched'])
-                        total_count = len(episodes)
-                    
-                    # Parallel mode: after first grey season, check if all unwatched
-                    # If so, we can assume all subsequent grey seasons are unwatched too
-                    if parallel_mode and idx == 0 and watched_status == 'none' and watched_count == 0 and total_count > 0:
-                        assume_grey_unwatched = True
+                    # Always load the season page fresh, ignore cache
+                    self.driver.get(season_url)
+                    self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                    season_html = self.driver.page_source
+                    episodes = self.scrape_episodes_from_html(season_html)
+                    watched_count = sum(1 for ep in episodes if ep['watched'])
+                    total_count = len(episodes)
 
                     seasons_data.append({
                         "season": season_label,
