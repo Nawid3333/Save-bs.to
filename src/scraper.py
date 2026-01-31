@@ -864,9 +864,24 @@ class BsToScraper:
     
     def _scrape_series_sequential(self, all_series):
         """Sequential scraping with progress bar and ETA"""
+        # Clear any leftover pause file from previous runs
+        pause_file = os.path.join(DATA_DIR, '.pause_scraping')
+        if os.path.exists(pause_file):
+            try:
+                os.remove(pause_file)
+                print(f"✓ Cleared old pause file: {pause_file}")
+            except Exception as e:
+                print(f"✗ Failed to remove old pause file: {e}")
         start_time = time.time()
         try:
             for idx, series in enumerate(all_series, 1):
+                # Check for pause file before processing each series
+                pause_file = os.path.join(DATA_DIR, '.pause_scraping')
+                if os.path.exists(pause_file):
+                    print("\n\n⏸ Pause requested. Scraping will pause after current series.")
+                    print(f"✓ Progress saved: {len(self.series_data)}/{len(all_series)} series scraped")
+                    print("→ Remove the .pause_scraping file and resume with 'Resume from checkpoint' option.\n")
+                    return
                 try:
                     # Calculate progress and ETA
                     elapsed = time.time() - start_time
@@ -1523,13 +1538,7 @@ class BsToScraper:
 
         # Run sequential to avoid extra workers for the small delta set
         self._scrape_series_sequential(filtered_series)
-        self.series_data = []
-        if not new_series_list:
-            print("✓ No new series detected — skipping scraper spin-up")
-            return
-
-        # Run sequential to avoid extra workers for the small delta set
-        self._scrape_series_sequential(new_series_list)
+        # The following block is redundant and used an undefined variable, so it is removed.
     
     def scrape_resume_checkpoint(self):
         """Resume from checkpoint"""
@@ -1573,6 +1582,14 @@ class BsToScraper:
     
     def scrape_single_series(self, url):
         """Scrape exactly one series (sequential, accurate)"""
+        # Clear any leftover pause file from previous runs
+        pause_file = os.path.join(DATA_DIR, '.pause_scraping')
+        if os.path.exists(pause_file):
+            try:
+                os.remove(pause_file)
+                print(f"✓ Cleared old pause file: {pause_file}")
+            except Exception as e:
+                print(f"✗ Failed to remove old pause file: {e}")
         print(f"→ Scraping single series: {url}")
         result = self.process_series_page(url)
         self.series_data = [result]
