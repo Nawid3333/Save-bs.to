@@ -26,7 +26,7 @@ from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIE
 
 # Performance settings
 # Allow overriding worker count via environment variable BS_MAX_WORKERS
-MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))
+MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "18"))
 USE_PARALLEL = True
 
 
