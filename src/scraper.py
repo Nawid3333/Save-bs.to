@@ -19,14 +19,13 @@ from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from queue import Queue, Empty
 import atexit
-import re
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
 
 # Performance settings
 # Allow overriding worker count via environment variable BS_MAX_WORKERS
-MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "18"))
+MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "24"))
 USE_PARALLEL = True
 
 
@@ -696,15 +695,85 @@ class BsToScraper:
                     season_label, season_url = season_item
                     watched_status = "none"  # Unknown, needs loading
                     season_type = 'regular' if is_regular_season(season_label) else season_label
-
+                
                 try:
-                    # Always load the season page fresh, ignore cache
-                    self.driver.get(season_url)
-                    self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
-                    season_html = self.driver.page_source
-                    episodes = self.scrape_episodes_from_html(season_html)
-                    watched_count = sum(1 for ep in episodes if ep['watched'])
-                    total_count = len(episodes)
+                    cached_season = existing_seasons.get(season_label)
+                    
+                    # Parallel mode: if we've confirmed series is unwatched, skip grey REGULAR seasons
+                    # Special seasons (OVA, Movies, Specials) are always checked individually
+                    if parallel_mode and assume_grey_unwatched and watched_status == 'none' and season_type == 'regular':
+                        if cached_season and cached_season.get('episodes'):
+                            # Use cached episodes, mark all unwatched
+                            episodes = []
+                            for ep in cached_season['episodes']:
+                                episodes.append({
+                                    'number': ep.get('number', ''),
+                                    'title': ep.get('title', ''),
+                                    'watched': False
+                                })
+                            watched_count = 0
+                            total_count = len(episodes)
+                            skipped_seasons += 1
+                        else:
+                            # No cache but we assume unwatched - still need to load for episode list
+                            self.driver.get(season_url)
+                            self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                            season_html = self.driver.page_source
+                            episodes = self.scrape_episodes_from_html(season_html)
+                            # Force all unwatched (we know series is unwatched)
+                            for ep in episodes:
+                                ep['watched'] = False
+                            watched_count = 0
+                            total_count = len(episodes)
+                    # Optimization: use cached data if available and status is definitive
+                    elif cached_season and cached_season.get('episodes'):
+                        cached_eps = cached_season['episodes']
+                        
+                        if watched_status == 'full':
+                            # Season is fully watched (green) - use cached episodes, mark all watched
+                            episodes = []
+                            for ep in cached_eps:
+                                episodes.append({
+                                    'number': ep.get('number', ''),
+                                    'title': ep.get('title', ''),
+                                    'watched': True  # Override to watched
+                                })
+                            watched_count = len(episodes)
+                            total_count = len(episodes)
+                            skipped_seasons += 1
+                        elif watched_status == 'none' and cached_season.get('watched_episodes', 0) == 0:
+                            # Season is unwatched (grey) AND was unwatched before - use cached
+                            episodes = []
+                            for ep in cached_eps:
+                                episodes.append({
+                                    'number': ep.get('number', ''),
+                                    'title': ep.get('title', ''),
+                                    'watched': False  # Keep unwatched
+                                })
+                            watched_count = 0
+                            total_count = len(episodes)
+                            skipped_seasons += 1
+                        else:
+                            # Status unclear or partial - must load to check
+                            self.driver.get(season_url)
+                            self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                            season_html = self.driver.page_source
+                            episodes = self.scrape_episodes_from_html(season_html)
+                            watched_count = sum(1 for ep in episodes if ep['watched'])
+                            total_count = len(episodes)
+                    else:
+                        # No cached data - must load
+                        self.driver.get(season_url)
+                        self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                        season_html = self.driver.page_source
+                        episodes = self.scrape_episodes_from_html(season_html)
+                        watched_count = sum(1 for ep in episodes if ep['watched'])
+                        total_count = len(episodes)
+                    
+                    # Parallel mode: after first grey season, check if all unwatched
+                    # If so, we can assume all subsequent grey seasons are unwatched too
+                    if parallel_mode and idx == 0 and watched_status == 'none' and watched_count == 0 and total_count > 0:
+                        assume_grey_unwatched = True
 
                     seasons_data.append({
                         "season": season_label,
@@ -794,24 +863,9 @@ class BsToScraper:
     
     def _scrape_series_sequential(self, all_series):
         """Sequential scraping with progress bar and ETA"""
-        # Clear any leftover pause file from previous runs
-        pause_file = os.path.join(DATA_DIR, '.pause_scraping')
-        if os.path.exists(pause_file):
-            try:
-                os.remove(pause_file)
-                print(f"✓ Cleared old pause file: {pause_file}")
-            except Exception as e:
-                print(f"✗ Failed to remove old pause file: {e}")
         start_time = time.time()
         try:
             for idx, series in enumerate(all_series, 1):
-                # Check for pause file before processing each series
-                pause_file = os.path.join(DATA_DIR, '.pause_scraping')
-                if os.path.exists(pause_file):
-                    print("\n\n⏸ Pause requested. Scraping will pause after current series.")
-                    print(f"✓ Progress saved: {len(self.series_data)}/{len(all_series)} series scraped")
-                    print("→ Remove the .pause_scraping file and resume with 'Resume from checkpoint' option.\n")
-                    return
                 try:
                     # Calculate progress and ETA
                     elapsed = time.time() - start_time
@@ -820,11 +874,14 @@ class BsToScraper:
                     eta_seconds = avg_time_per_series * remaining_series
                     eta_mins = int(eta_seconds / 60)
                     progress_pct = int((idx / len(all_series)) * 100)
+                    
                     # Progress bar
                     bar_length = 30
                     filled = int(bar_length * idx / len(all_series))
                     bar = '█' * filled + '░' * (bar_length - filled)
+                    
                     print(f"\n[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | {series['title']}")
+                    
                     result = self.process_series_page(series['url'], series_hint=series)
                     if result:
                         # Mark empty series
@@ -840,10 +897,8 @@ class BsToScraper:
                         self.save_checkpoint()
                     else:
                         print("  ⚠ Skipped (no data)")
-                        self.failed_links.append(series)
                 except Exception as e:
                     print(f"  ⚠ Error processing {series['title']}: {str(e)}")
-                    self.failed_links.append(series)
                     continue
         except KeyboardInterrupt:
             print("\n\n⚠ Scraping interrupted by user (Ctrl+C)")
@@ -1418,29 +1473,15 @@ class BsToScraper:
     
     def load_existing_links(self):
         """Load existing series links to avoid re-scraping"""
-        def normalize_link(link):
-            if not link:
-                return ''
-            link = link.strip().lower()
-            if not link.startswith('/'):
-                link = '/' + link
-            # Remove season/episode suffix: /serie/Name/1/de -> /serie/Name
-            return re.sub(r'/\d+(/de)?$', '', link)
         existing = set()
         try:
             if os.path.exists(SERIES_INDEX_FILE):
                 with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
                 for item in data or []:
-                    # Check all link variations if present
-                    variations = item.get('link_variations')
-                    if variations and isinstance(variations, list):
-                        for v in variations:
-                            existing.add(normalize_link(v))
-                    else:
-                        link = item.get('link')
-                        if link:
-                            existing.add(normalize_link(link))
+                    link = item.get('link')
+                    if link:
+                        existing.add(link)
         except Exception:
             pass
         return existing
@@ -1449,25 +1490,16 @@ class BsToScraper:
         """Scrape only new series not in index"""
         all_series = self.get_all_series()
         existing_links = self.load_existing_links()
-        def normalize_link(link):
-            if not link:
-                return ''
-            link = link.strip().lower()
-            if not link.startswith('/'):
-                link = '/' + link
-            # Remove season/episode suffix: /serie/Name/1/de -> /serie/Name
-            return re.sub(r'/\d+(/de)?$', '', link)
-        filtered_series = [s for s in all_series if normalize_link(s.get('link')) not in existing_links]
+        new_series_list = [s for s in all_series if s.get('link') not in existing_links]
 
-        print(f"→ New series to scrape: {len(filtered_series)} (out of {len(all_series)})")
+        print(f"→ New series to scrape: {len(new_series_list)} (out of {len(all_series)})")
         self.series_data = []
-        if not filtered_series:
+        if not new_series_list:
             print("✓ No new series detected — skipping scraper spin-up")
             return
 
         # Run sequential to avoid extra workers for the small delta set
-        self._scrape_series_sequential(filtered_series)
-        # The following block is redundant and used an undefined variable, so it is removed.
+        self._scrape_series_sequential(new_series_list)
     
     def scrape_resume_checkpoint(self):
         """Resume from checkpoint"""
@@ -1511,14 +1543,6 @@ class BsToScraper:
     
     def scrape_single_series(self, url):
         """Scrape exactly one series (sequential, accurate)"""
-        # Clear any leftover pause file from previous runs
-        pause_file = os.path.join(DATA_DIR, '.pause_scraping')
-        if os.path.exists(pause_file):
-            try:
-                os.remove(pause_file)
-                print(f"✓ Cleared old pause file: {pause_file}")
-            except Exception as e:
-                print(f"✗ Failed to remove old pause file: {e}")
         print(f"→ Scraping single series: {url}")
         result = self.process_series_page(url)
         self.series_data = [result]
