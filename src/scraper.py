@@ -211,7 +211,8 @@ class BsToScraper:
     def wait_for_element(self, driver, selector_by, selector_value, timeout=None):
         """Wait for element to be present and visible"""
         if timeout is None:
-            timeout = self.get_timing('timeout') or 15
+            # Increase default timeout to 20 seconds for more reliability
+            timeout = self.get_timing('timeout') or 20
         try:
             WebDriverWait(driver, timeout).until(
                 EC.presence_of_element_located((selector_by, selector_value))
@@ -655,8 +656,10 @@ class BsToScraper:
         """
         try:
             self.driver.get(url)
-            # Wait for title to appear
-            self.wait_for_css_element(self.driver, "h2", timeout=3)
+            # Wait for the body to be present and visible (ensures page is loaded)
+            self.wait_for_css_element(self.driver, "body", timeout=10)
+            # Wait for title to appear (series title)
+            self.wait_for_css_element(self.driver, "h2", timeout=6)
 
             page_content = self.driver.page_source
 
@@ -717,7 +720,9 @@ class BsToScraper:
                         else:
                             # No cache but we assume unwatched - still need to load for episode list
                             self.driver.get(season_url)
-                            self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                            # Wait for the page and episodes table to be fully loaded
+                            self.wait_for_css_element(self.driver, "body", timeout=10)
+                            self.wait_for_css_element(self.driver, "table.episodes", timeout=8)
                             season_html = self.driver.page_source
                             episodes = self.scrape_episodes_from_html(season_html)
                             # Force all unwatched (we know series is unwatched)
@@ -756,7 +761,9 @@ class BsToScraper:
                         else:
                             # Status unclear or partial - must load to check
                             self.driver.get(season_url)
-                            self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                            # Wait for the page and episodes table to be fully loaded
+                            self.wait_for_css_element(self.driver, "body", timeout=10)
+                            self.wait_for_css_element(self.driver, "table.episodes", timeout=8)
                             season_html = self.driver.page_source
                             episodes = self.scrape_episodes_from_html(season_html)
                             watched_count = sum(1 for ep in episodes if ep['watched'])
@@ -764,7 +771,9 @@ class BsToScraper:
                     else:
                         # No cached data - must load
                         self.driver.get(season_url)
-                        self.wait_for_css_element(self.driver, "table.episodes", timeout=3)
+                        # Wait for the page and episodes table to be fully loaded
+                        self.wait_for_css_element(self.driver, "body", timeout=10)
+                        self.wait_for_css_element(self.driver, "table.episodes", timeout=8)
                         season_html = self.driver.page_source
                         episodes = self.scrape_episodes_from_html(season_html)
                         watched_count = sum(1 for ep in episodes if ep['watched'])

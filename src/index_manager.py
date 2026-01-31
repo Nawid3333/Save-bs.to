@@ -159,7 +159,24 @@ def display_changes(changes, include_unwatched=True, new_data=None):
 
     if changes["new_series"]:
         print(f"\n✨ NEW SERIES ({len(changes['new_series'])})")
-        paginate_list(changes["new_series"], lambda title: f"  + {title}")
+        def format_new_series(title):
+            if not new_data:
+                return f"  + {title}"
+            # Find the series entry in new_data
+            series = None
+            if isinstance(new_data, list):
+                for s in new_data:
+                    if s.get('title') == title:
+                        series = s
+                        break
+            elif isinstance(new_data, dict):
+                series = new_data.get(title)
+            if not series:
+                return f"  + {title}"
+            watched = series.get('watched_episodes', 0)
+            total = series.get('total_episodes', 0)
+            return f"  + {title}: {watched}/{total} watched"
+        paginate_list(changes["new_series"], format_new_series)
 
     if changes["new_episodes"]:
         if new_data:
