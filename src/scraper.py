@@ -17,7 +17,6 @@ from selenium.webdriver.firefox.service import Service as FirefoxService
 import sys
 from bs4 import BeautifulSoup
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from queue import Queue, Empty
 import atexit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

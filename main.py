@@ -95,12 +95,11 @@ def show_menu():
     print("  2. Scrape only NEW series (faster)")
     print("  3. Add single series by URL")
     print("  4. Generate full report")
-    print("  5. Show series with progress (sorted)")
-    print("  6. Batch add series from text file")
-    print("  7. Retry failed series from last run")
-    print("  8. Pause current scraping (in another terminal)")
-    print("  9. Show active workers")
-    print("  10. Exit\n")
+    print("  5. Batch add series from text file")
+    print("  6. Retry failed series from last run")
+    print("  7. Pause current scraping (in another terminal)")
+    print("  8. Show active workers")
+    print("  9. Exit\n")
 
 
 def scrape_series():
@@ -180,145 +179,6 @@ def scrape_new_series():
     except Exception as e:
         print(f"\n✗ Unexpected error during new-only scraping: {str(e)}")
         logger.error(f"Unexpected error in scrape_new_series: {e}")
-
-
-def create_progress_bar(percent, width=20):
-    """Create a visual progress bar"""
-    filled = int(width * percent / 100)
-    bar = "█" * filled + "░" * (width - filled)
-    return bar
-
-
-def show_series_with_progress():
-    """Display all series with progress bars and sorting options"""
-    manager = IndexManager()
-    
-    print("\n📊 SERIES PROGRESS VIEW")
-    print("-" * 60)
-    print("\nSort by:")
-    print("  1. Completion % (incomplete first)")
-    print("  2. Series name (A-Z)")
-    print("  3. Date added")
-    print("  4. Total episodes (least first)")
-    print("  5. Total episodes (most first)")
-    
-    sort_choice = input("\nChoose sort option (1-5) [default: 1]: ").strip() or '1'
-    compact_choice = input("Compact view? (y/n) [default: y]: ").strip().lower() or 'y'
-    compact = compact_choice != 'n'
-    
-    print("\nFilter:")
-    print("  1. All series")
-    print("  2. Only unwatched (0% complete)")
-    print("  3. Only unfinished (started but incomplete)")
-    
-    filter_choice = input("\nChoose filter (1-3) [default: 1]: ").strip() or '1'
-    
-    sort_map = {
-        '1': 'completion',
-        '2': 'name',
-        '3': 'date',
-        '4': 'total_episodes',
-        '5': 'total_episodes_desc'
-    }
-    sort_by = sort_map.get(sort_choice, 'completion')
-    
-    # Get series with progress
-    series_list = manager.get_series_with_progress(sort_by=sort_by)
-    
-    # Apply filters
-    if filter_choice == '2':
-        series_list = [s for s in series_list if s['watched_episodes'] == 0]
-    elif filter_choice == '3':
-        series_list = [s for s in series_list if s['is_incomplete'] and s['watched_episodes'] > 0]
-    
-    if not series_list:
-        print("✗ No series found\n")
-        return
-    
-
-    page_size = 25
-    max_pages = 20  # Prevent infinite pagination
-
-    title_width = 32 if compact else 40
-    bar_width = 14 if compact else 20
-    status_width = 9 if compact else 10
-    separator = "-" * (title_width + bar_width + status_width + 8)
-
-    total_items = len(series_list)
-    index = 0
-    page_num = 1
-    while index < total_items:
-        end = min(index + page_size, total_items)
-        print(f"\nPage {page_num} ({index+1}-{end} of {total_items})")
-        print(f"{'Série':<{title_width}} {'Progress':<{bar_width+6}} {'Status':>{status_width}}")
-        print(separator)
-        for series in series_list[index:end]:
-            title = series['title'][:title_width-2]  # Truncate long names
-            progress_bar = create_progress_bar(series['completion'], width=bar_width)
-            percent = series['completion']
-            watched = series['watched_episodes']
-            total = series['total_episodes']
-            # Status indicator
-            if series['is_incomplete']:
-                status = f"⚠️ {percent}%"
-                watched_info = f"({watched}/{total})"
-            else:
-                status = f"✓ 100%"
-                watched_info = f"({watched}/{total})"
-            print(f"{title:<{title_width}} {progress_bar} {watched_info:>7}  {status:>{status_width}}")
-        print(separator)
-        index = end
-        page_num += 1
-        if index < total_items:
-            cont = input("More? (Enter = next, q = stop): ").strip().lower()
-            if cont == 'q':
-                break
-        if page_num > max_pages:
-            print("\n✗ Too many pages, stopping pagination.")
-            break
-
-    print(f"\nTotal: {total_items} series")
-    incomplete_series = [s for s in series_list if s['is_incomplete']]
-    incomplete = len(incomplete_series)
-    if incomplete > 0:
-        print(f"⚠️  {incomplete} series incomplete")
-        
-        # Offer to rescrape all incomplete
-        rescrape = input(f"\nRescrape all {incomplete} incomplete series for updates? (y/n): ").strip().lower()
-        if rescrape == 'y':
-            # Build URL list from incomplete series
-            urls = []
-            for s in incomplete_series:
-                series_data = manager.series_index.get(s['title'], {})
-                url = series_data.get('url') or series_data.get('link')
-                if url:
-                    if not url.startswith('http'):
-                        url = f"https://bs.to{url}"
-                    urls.append(url)
-            
-            if urls:
-                print(f"\n→ Rescraping {len(urls)} incomplete series...")
-                print("  (Browser will open - do not close it manually)\n")
-                
-                try:
-                    scraper = BsToScraper()
-                    scraper.run(SERIES_INDEX_FILE, url_list=urls)
-                    
-                    if scraper.series_data:
-                        if confirm_and_save_changes(scraper.series_data, f"Rescrape data ({len(urls)} series)"):
-                            print(f"\n✓ Rescrape completed! {len(urls)} series updated.")
-                            print_scraped_series_status()
-                            logger.info(f"Rescraped {len(urls)} incomplete series")
-                    else:
-                        print("\n⚠ No data scraped")
-                        logger.warning("No data scraped during rescrape operation")
-                except Exception as e:
-                    print(f"\n✗ Rescrape failed: {str(e)}")
-                    logger.error(f"Rescrape failed: {e}")
-            else:
-                print("✗ Could not find URLs for incomplete series")
-    else:
-        print("✓ All series completed!\n")
 
 
 def generate_report():
@@ -682,16 +542,14 @@ def main():
         elif choice == '4':
             generate_report()
         elif choice == '5':
-            show_series_with_progress()
-        elif choice == '6':
             batch_add_series_from_file()
-        elif choice == '7':
+        elif choice == '6':
             retry_failed_series()
-        elif choice == '8':
+        elif choice == '7':
             pause_scraping()
-        elif choice == '9':
+        elif choice == '8':
             show_active_workers()
-        elif choice == '10':
+        elif choice == '9':
             print("\n✓ Goodbye!\n")
             break
 

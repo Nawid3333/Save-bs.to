@@ -3,6 +3,7 @@ import os
 from datetime import datetime
 import sys
 import logging
+from collections import defaultdict
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -58,7 +59,6 @@ def group_episodes_by_season(episode_list, new_data):
     Group episodes by series and season, showing count even for partial seasons.
     Returns: list of display strings, already formatted
     """
-    from collections import defaultdict
     
     # Group by (title, season)
     grouped = defaultdict(list)
