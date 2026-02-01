@@ -521,54 +521,46 @@ class BsToScraper:
         series_config = self.get_selector('series_page')
         if not series_config:
             return []
-        
-        seasons_selector = series_config.get('seasons_selector', {})
-        selector_id = seasons_selector.get('value', 'seasons')
-        
-        # Get watched class config
-        watched_class_config = series_config.get('season_watched_class', {})
-        full_watched_class = watched_class_config.get('full', 'watched')
-        
-        seasons_div = soup.find(id=selector_id)
-        if seasons_div:
-            season_links_config = series_config.get('season_links', {})
-            season_type = season_links_config.get('type', 'css')
-            season_value = season_links_config.get('value')
-            
-            if season_type == 'css':
-                season_elems = seasons_div.select(season_value)
+
+        # Get config for season selector
+        season_selector = series_config.get('season_selector', {})
+        season_type = season_selector.get('type', 'css')
+        season_value = season_selector.get('value')
+        full_watched_class = season_selector.get('full_watched_class', 'watched')
+
+        if not season_value:
+            return []
+
+        # Find all season links
+        if season_type == 'css':
+            season_elems = soup.select(season_value)
+        else:
+            season_elems = soup.find_all(season_value)
+
+        for elem in season_elems:
+            label = elem.get_text(strip=True)
+            href = elem.get('href', '')
+            classes = elem.get('class', [])
+            if isinstance(classes, str):
+                classes = classes.split()
+
+            if full_watched_class and full_watched_class in classes:
+                watched_status = 'full'  # All episodes watched (green) - skip loading
             else:
-                season_elems = seasons_div.find_all('a')
-            
-            for a in season_elems:
-                label = a.get_text(strip=True)
-                href = a.get('href', '')
-                if not href.startswith('http'):
-                    site_url = self.get_site_url()
-                    href = f"{site_url}/{href.lstrip('/')}"
+                watched_status = 'none'
 
-                # Detect watched status from parent <li> element's CSS class
-                parent_li = a.find_parent('li')
-                if parent_li:
-                    classes = parent_li.get('class', [])
-                else:
-                    classes = []
-                if isinstance(classes, str):
-                    classes = classes.split()
+            # Tag season type: 'regular' or special label
+            if is_regular_season(label):
+                season_type_val = 'regular'
+            else:
+                # Use the label as the type for specials (e.g., 'OVA', 'Special', 'Movie', etc.)
+                season_type_val = label
 
-                if full_watched_class and full_watched_class in classes:
-                    watched_status = 'full'  # All episodes watched (green) - skip loading
-                else:
-                    watched_status = 'none'
+            # Ensure proper URL construction
+            if href and not href.startswith('http') and not href.startswith('/'):
+                href = '/' + href
 
-                # Tag season type: 'regular' or special label
-                if is_regular_season(label):
-                    season_type = 'regular'
-                else:
-                    # Use the label as the type for specials (e.g., 'OVA', 'Special', 'Movie', etc.)
-                    season_type = label
-
-                season_links.append((label, href, watched_status, season_type))
+            season_links.append((label, base_url.rstrip('/') + href if href and not href.startswith('http') else href, watched_status, season_type_val))
 
         # Deduplicate while preserving order
         seen = set()
@@ -1499,7 +1491,24 @@ class BsToScraper:
         """Scrape only new series not in index"""
         all_series = self.get_all_series()
         existing_links = self.load_existing_links()
-        new_series_list = [s for s in all_series if s.get('link') not in existing_links]
+        # Also load the full index to check for 'empty' flag
+        existing_index = {}
+        try:
+            if os.path.exists(SERIES_INDEX_FILE):
+                with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                for item in data or []:
+                    if item.get('link'):
+                        existing_index[item.get('link')] = item
+        except Exception:
+            pass
+
+        def is_already_in_index(s):
+            link = s.get('link')
+            entry = existing_index.get(link)
+            return link in existing_links or (entry is not None and (entry.get('empty') or entry.get('total_episodes', 0) == 0))
+
+        new_series_list = [s for s in all_series if not is_already_in_index(s)]
 
         print(f"→ New series to scrape: {len(new_series_list)} (out of {len(all_series)})")
         self.series_data = []
