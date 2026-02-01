@@ -657,6 +657,26 @@ class IndexManager:
     def get_series_with_progress(self, sort_by='completion', reverse=False):
         """
         Get series with episode progress information
-        
-        Args:
+        Returns a list of dicts, each with keys: title, watched_episodes, total_episodes, is_incomplete, completion, etc.
         """
+        series_list = []
+        for s in self.series_index.values():
+            total_eps = 0
+            watched_eps = 0
+            for season in s.get('seasons', []):
+                eps = season.get('episodes', [])
+                total_eps += len(eps)
+                watched_eps += sum(1 for ep in eps if ep.get('watched', False))
+            is_incomplete = (total_eps == 0) or (watched_eps < total_eps)
+            completion = (watched_eps / total_eps) if total_eps > 0 else 0.0
+            series_list.append({
+                'title': s.get('title', ''),
+                'watched_episodes': watched_eps,
+                'total_episodes': total_eps,
+                'is_incomplete': is_incomplete,
+                'completion': completion,
+                'empty': s.get('empty', False)
+            })
+        if sort_by:
+            series_list.sort(key=lambda x: x.get(sort_by, 0), reverse=reverse)
+        return series_list
