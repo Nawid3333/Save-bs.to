@@ -87,11 +87,11 @@ def group_episodes_by_season(episode_list, new_data):
         count = len(ep_nums)
         if total_in_season > 0:
             # Always show watched/total at end
-            result.append(f"  ✓ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+            result.append(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
         else:
             # Fallback if we can't find total - list individual episodes
             for ep_num in sorted(ep_nums):
-                result.append(f"  ✓ {title} {format_season_ep(season, ep_num)}")
+                result.append(f"  [+] {title} {format_season_ep(season, ep_num)}")
     
     return result
 
@@ -130,16 +130,31 @@ def print_changes(old_data, new_data):
         old_series = old_data[title]
         new_series = new_data[title]
         
+        # Build map of (season, ep_number) -> watched status for old data
         old_eps = {}
         for season in old_series.get('seasons', []):
             s_label = season.get('season', '')
             for ep in season.get('episodes', []):
                 old_eps[(s_label, ep.get('number'))] = ep.get('watched', False)
         
-        # Calculate series progress for context on unwatched changes
-        total_eps = sum(1 for eps in old_eps.values())
-        watched_eps = sum(1 for w in old_eps.values() if w)
-        # ...existing code...
+        # Check new episodes and watch status changes
+        for season in new_series.get('seasons', []):
+            s_label = season.get('season', '')
+            for ep in season.get('episodes', []):
+                ep_num = ep.get('number')
+                ep_key = (s_label, ep_num)
+                new_watched = ep.get('watched', False)
+                
+                if ep_key not in old_eps:
+                    # Brand new episode
+                    changes["new_episodes"].append((title, s_label, ep_num))
+                elif old_eps[ep_key] != new_watched:
+                    # Watch status changed
+                    if old_eps[ep_key] is False and new_watched is True:
+                        changes["newly_watched"].append((title, s_label, ep_num))
+                    elif old_eps[ep_key] is True and new_watched is False:
+                        changes["newly_unwatched"].append((title, s_label, ep_num))
+    
     return changes
 
 
@@ -158,7 +173,7 @@ def display_changes(changes, include_unwatched=True, new_data=None):
     print("="*70)
 
     if changes["new_series"]:
-        print(f"\n✨ NEW SERIES ({len(changes['new_series'])})")
+        print(f"\n[NEW SERIES] ({len(changes['new_series'])})")
         def format_new_series(title):
             if not new_data:
                 return f"  + {title}"
@@ -181,7 +196,7 @@ def display_changes(changes, include_unwatched=True, new_data=None):
     if changes["new_episodes"]:
         if new_data:
             grouped_lines = group_episodes_by_season([(x[0], x[1], x[2]) for x in changes["new_episodes"]], new_data)
-            print(f"\n📺 NEW EPISODES ({len(changes['new_episodes'])})")
+            print(f"\n[NEW EPISODES] ({len(changes['new_episodes'])})")
             for line in grouped_lines:
                 print(line)
         else:
@@ -191,11 +206,10 @@ def display_changes(changes, include_unwatched=True, new_data=None):
 
     if changes["newly_watched"]:
         if new_data:
-            from collections import defaultdict
             grouped = defaultdict(list)
             for title, season, ep_num in changes["newly_watched"]:
                 grouped[(title, season)].append(ep_num)
-            print(f"\n✅ NEWLY WATCHED ({len(changes['newly_watched'])} episodes)")
+            print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])} episodes)")
             for (title, season), ep_nums in grouped.items():
                 series = None
                 if isinstance(new_data, list):
@@ -214,22 +228,21 @@ def display_changes(changes, include_unwatched=True, new_data=None):
                             watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
                             break
                 if total_in_season > 0:
-                    print(f"  ✓ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                    print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
                 else:
                     for ep_num in sorted(ep_nums):
-                        print(f"  ✓ {title} [{season}] Ep {ep_num}")
+                        print(f"  [+] {title} [{season}] Ep {ep_num}")
         else:
-            print(f"\n✅ NEWLY WATCHED ({len(changes['newly_watched'])}) [ungrouped fallback]")
+            print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])}) [ungrouped fallback]")
             for x in changes["newly_watched"]:
-                print(f"  ✓ {x[0]} [{x[1]}] Ep {x[2]}")
+                print(f"  [+] {x[0]} [{x[1]}] Ep {x[2]}")
 
     if changes.get("newly_unwatched"):
         if new_data:
-            from collections import defaultdict
             grouped = defaultdict(list)
             for x in changes["newly_unwatched"]:
                 grouped[(x[0], x[1])].append(x[2])
-            print(f"\n⚠️  SITE REPORTS UNWATCHED ({len(changes['newly_unwatched'])} episodes)")
+            print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])} episodes)")
             for (title, season), ep_nums in grouped.items():
                 series = None
                 if isinstance(new_data, list):
@@ -248,99 +261,14 @@ def display_changes(changes, include_unwatched=True, new_data=None):
                             watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
                             break
                 if total_in_season > 0:
-                    print(f"  ⚠ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                    print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
                 else:
                     for ep_num in sorted(ep_nums):
-                        print(f"  ⚠ {title} [{season}] Ep {ep_num}")
+                        print(f"  [!] {title} [{season}] Ep {ep_num}")
         else:
-            print(f"\n⚠️  SITE REPORTS UNWATCHED ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
+            print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
             for x in changes["newly_unwatched"]:
-                print(f"  ⚠ {x[0]} [{x[1]}] Ep {x[2]}")
-    print("\n" + "="*70)
-    return 0
-    
-    if changes["new_series"]:
-        print(f"\n✨ NEW SERIES ({len(changes['new_series'])})")
-        paginate_list(changes["new_series"], lambda title: f"  + {title}")
-    
-    if changes["new_episodes"]:
-        if new_data:
-            grouped_lines = group_episodes_by_season([(x[0], x[1], x[2]) for x in changes["new_episodes"]], new_data)
-            print(f"\n📺 NEW EPISODES ({len(changes['new_episodes'])})")
-            for line in grouped_lines:
-                print(line)
-        else:
-            print(f"\n📺 NEW EPISODES ({len(changes['new_episodes'])}) [ungrouped fallback]")
-            for x in changes["new_episodes"]:
-                print(f"  + {x[0]} [{x[1]}] Ep {x[2]}")
-
-    if changes["newly_watched"]:
-        if new_data:
-            from collections import defaultdict
-            grouped = defaultdict(list)
-            for title, season, ep_num in changes["newly_watched"]:
-                grouped[(title, season)].append(ep_num)
-            print(f"\n✅ NEWLY WATCHED ({len(changes['newly_watched'])} episodes)")
-            for (title, season), ep_nums in grouped.items():
-                series = None
-                if isinstance(new_data, list):
-                    for s in new_data:
-                        if s.get('title') == title:
-                            series = s
-                            break
-                else:
-                    series = new_data.get(title)
-                total_in_season = 0
-                watched_in_season = 0
-                if series:
-                    for s in series.get('seasons', []):
-                        if s.get('season') == season:
-                            total_in_season = len(s.get('episodes', []))
-                            watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                            break
-                if total_in_season > 0:
-                    print(f"  ✓ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
-                else:
-                    for ep_num in sorted(ep_nums):
-                        print(f"  ✓ {title} [{season}] Ep {ep_num}")
-        else:
-            print(f"\n✅ NEWLY WATCHED ({len(changes['newly_watched'])}) [ungrouped fallback]")
-            for x in changes["newly_watched"]:
-                print(f"  ✓ {x[0]} [{x[1]}] Ep {x[2]}")
-
-    if changes.get("newly_unwatched"):
-        if new_data:
-            from collections import defaultdict
-            grouped = defaultdict(list)
-            for x in changes["newly_unwatched"]:
-                grouped[(x[0], x[1])].append(x[2])
-            print(f"\n⚠️  SITE REPORTS UNWATCHED ({len(changes['newly_unwatched'])} episodes)")
-            for (title, season), ep_nums in grouped.items():
-                series = None
-                if isinstance(new_data, list):
-                    for s in new_data:
-                        if s.get('title') == title:
-                            series = s
-                            break
-                else:
-                    series = new_data.get(title)
-                total_in_season = 0
-                watched_in_season = 0
-                if series:
-                    for s in series.get('seasons', []):
-                        if s.get('season') == season:
-                            total_in_season = len(s.get('episodes', []))
-                            watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                            break
-                if total_in_season > 0:
-                    print(f"  ⚠ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
-                else:
-                    for ep_num in sorted(ep_nums):
-                        print(f"  ⚠ {title} [{season}] Ep {ep_num}")
-        else:
-            print(f"\n⚠️  SITE REPORTS UNWATCHED ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
-            for x in changes["newly_unwatched"]:
-                print(f"  ⚠ {x[0]} [{x[1]}] Ep {x[2]}")
+                print(f"  [!] {x[0]} [{x[1]}] Ep {x[2]}")
     
     print("\n" + "="*70)
     return 0
@@ -393,10 +321,9 @@ def confirm_and_save_changes(new_data, description="data"):
     # Confirm watched (unwatched→watched)
     if changes["newly_watched"]:
         logging.info(f"Prompting user to confirm marking {len(changes['newly_watched'])} episodes as watched.")
-        print(f"\n✅ {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
+        print(f"\n[OK] {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
         print("   (manual confirmation required for all watched changes)")
         print("\n" + "-"*70)
-        from collections import defaultdict
         grouped = defaultdict(list)
         for x in changes["newly_watched"]:
             grouped[(x[0], x[1])].append(x[2])
@@ -411,9 +338,9 @@ def confirm_and_save_changes(new_data, description="data"):
                         watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
                         break
             if total_in_season > 0:
-                print(f"  ✓ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
             else:
-                print(f"  ✓ {title} [{season}]: {len(ep_nums)} episode(s)")
+                print(f"  [+] {title} [{season}]: {len(ep_nums)} episode(s)")
         print("-"*70)
         watched_response = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
         if watched_response == 'y':
@@ -426,10 +353,9 @@ def confirm_and_save_changes(new_data, description="data"):
     # Confirm unwatched (watched→unwatched)
     if changes["newly_unwatched"]:
         logging.info(f"Prompting user to confirm marking {len(changes['newly_unwatched'])} episodes as unwatched.")
-        print(f"\n⚠️  {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
+        print(f"\n[WARN] {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
         print("   (manual confirmation required for all unwatched changes)")
         print("\n" + "-"*70)
-        from collections import defaultdict
         grouped = defaultdict(list)
         for x in changes["newly_unwatched"]:
             grouped[(x[0], x[1])].append(x[2])
@@ -444,9 +370,9 @@ def confirm_and_save_changes(new_data, description="data"):
                         watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
                         break
             if total_in_season > 0:
-                print(f"  ⚠ {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
             else:
-                print(f"  ⚠ {title} [{season}]: {len(ep_nums)} episode(s)")
+                print(f"  [!] {title} [{season}]: {len(ep_nums)} episode(s)")
         print("-"*70)
         unwatch_response = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
         if unwatch_response == 'y':
@@ -571,10 +497,10 @@ class IndexManager:
                 else:
                     # Unknown format, fallback to empty
                     self.series_index = {}
-                print(f"✓ Loaded {len(self.series_index)} series from index")
+                print(f"[OK] Loaded {len(self.series_index)} series from index")
                 logging.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
             except Exception as e:
-                print(f"⚠ Error loading index: {str(e)}")
+                print(f"[WARN] Error loading index: {str(e)}")
                 logging.error(f"Error loading index: {str(e)}")
                 self.series_index = {}
 
@@ -597,18 +523,77 @@ class IndexManager:
                 self.series_index[title] = series
 
     def get_statistics(self):
+        """Enhanced statistics with detailed analytics"""
         series_with_progress = self.get_series_with_progress()
         total = len(series_with_progress)
+        
+        if total == 0:
+            return {
+                "total_series": 0,
+                "watched": 0,
+                "unwatched": 0,
+                "watched_percentage": 0.0,
+                "empty_series": 0
+            }
+        
         watched = sum(1 for s in series_with_progress if not s['is_incomplete'])
         unwatched = total - watched
         empty_count = len([s for s in self.series_index.values() if s.get('empty', False)])
-
+        
+        # Calculate completion percentages
+        completion_percentages = [s['completion'] for s in series_with_progress]
+        avg_completion = round(sum(completion_percentages) / total, 2)
+        
+        # Episode statistics
+        total_episodes = sum(s['total_episodes'] for s in series_with_progress)
+        watched_episodes = sum(s['watched_episodes'] for s in series_with_progress)
+        avg_episodes_per_series = round(total_episodes / total, 1) if total > 0 else 0
+        
+        # Completion distribution
+        completion_ranges = {
+            "0-25%": sum(1 for p in completion_percentages if 0 <= p < 25),
+            "25-50%": sum(1 for p in completion_percentages if 25 <= p < 50),
+            "50-75%": sum(1 for p in completion_percentages if 50 <= p < 75),
+            "75-99%": sum(1 for p in completion_percentages if 75 <= p < 100),
+            "100%": sum(1 for p in completion_percentages if p == 100)
+        }
+        
+        # Top/bottom performers
+        sorted_by_completion = sorted(series_with_progress, key=lambda x: x['completion'], reverse=True)
+        most_completed = sorted_by_completion[:5] if len(sorted_by_completion) >= 5 else sorted_by_completion
+        least_completed = sorted_by_completion[-5:] if len(sorted_by_completion) >= 5 else sorted_by_completion
+        
         return {
+            # Basic counts
             "total_series": total,
             "watched": watched,
             "unwatched": unwatched,
-            "watched_percentage": round((watched / total * 100) if total > 0 else 0, 2),
-            "empty_series": empty_count
+            "watched_percentage": round((watched / total * 100), 2),
+            "empty_series": empty_count,
+            
+            # Completion analytics
+            "average_completion": avg_completion,
+            
+            # Episode statistics
+            "total_episodes": total_episodes,
+            "watched_episodes": watched_episodes,
+            "unwatched_episodes": total_episodes - watched_episodes,
+            "average_episodes_per_series": avg_episodes_per_series,
+            
+            # Completion distribution
+            "completion_distribution": completion_ranges,
+            
+            # Top performers
+            "most_completed_series": [
+                {"title": s['title'], "completion": s['completion'], "progress": f"{s['watched_episodes']}/{s['total_episodes']}"}
+                for s in most_completed
+            ],
+            
+            # Bottom performers (excluding 100% completed)
+            "least_completed_series": [
+                {"title": s['title'], "completion": s['completion'], "progress": f"{s['watched_episodes']}/{s['total_episodes']}"}
+                for s in least_completed if s['completion'] < 100
+            ][:5]  # Limit to 5, excluding 100% completed
         }
         
     def save_index(self):
@@ -630,27 +615,80 @@ class IndexManager:
         self.save_index()
         
     def get_full_report(self):
-        """Generate a full report of all series including ongoing/started"""
+        """Generate a comprehensive report with detailed analytics"""
         series_progress = self.get_series_with_progress()
-        watched_titles = [s['title'] for s in series_progress if not s['is_incomplete']]
+        stats = self.get_statistics()
+        
+        # Categorize series
+        watched_series = [s for s in series_progress if not s['is_incomplete']]
         ongoing_series = [s for s in series_progress if s['is_incomplete'] and s['watched_episodes'] > 0]
-        not_started = [s for s in series_progress if s['is_incomplete'] and s['watched_episodes'] == 0]
+        not_started_series = [s for s in series_progress if s['is_incomplete'] and s['watched_episodes'] == 0]
         
         # Sort ongoing by completion % (descending)
-        ongoing_titles = sorted([s['title'] for s in ongoing_series], 
-                               key=lambda x: next((s['completion'] for s in ongoing_series if s['title'] == x), 0), 
-                               reverse=True)
-        not_started_titles = sorted([s['title'] for s in not_started])
-
+        ongoing_sorted = sorted(ongoing_series, key=lambda x: x['completion'], reverse=True)
+        ongoing_titles = [s['title'] for s in ongoing_sorted]
+        
+        # Sort not started alphabetically
+        not_started_titles = sorted([s['title'] for s in not_started_series])
+        
+        # Additional categories
+        recently_watched = []
+        if hasattr(self, '_last_updated') and self._last_updated:
+            # Could be enhanced to track actual watch dates if available
+            recently_watched = [s['title'] for s in watched_series][:10]  # Top 10 as placeholder
+        
+        # Series by episode count ranges
+        episode_ranges = {
+            "short_series": [s['title'] for s in series_progress if s['total_episodes'] <= 5],
+            "medium_series": [s['title'] for s in series_progress if 6 <= s['total_episodes'] <= 25],
+            "long_series": [s['title'] for s in series_progress if s['total_episodes'] > 25]
+        }
+        
+        # Completion insights
+        completion_insights = {
+            "high_completion_threshold": 80,  # Series with >80% completion
+            "near_completion": [s['title'] for s in ongoing_sorted 
+                              if 80 <= s['completion'] < 100][:10],
+            "stalled_series": [s['title'] for s in ongoing_sorted 
+                             if s['completion'] < 25][:10]
+        }
+        
         report = {
             "metadata": {
                 "generated": datetime.now().isoformat(),
-                "statistics": self.get_statistics()
+                "total_series_in_index": len(self.series_index),
+                "active_series": len(series_progress),  # Excluding empty series
+                "statistics": stats
             },
-            "watched": sorted(watched_titles),
-            "ongoing": ongoing_titles,
-            "not_started": not_started_titles,
-            "all_series": self.series_index
+            "categories": {
+                "watched": {
+                    "count": len(watched_series),
+                    "titles": sorted([s['title'] for s in watched_series])
+                },
+                "ongoing": {
+                    "count": len(ongoing_series),
+                    "titles": ongoing_titles,
+                    "details": [{"title": s['title'], "completion": s['completion'], 
+                               "progress": f"{s['watched_episodes']}/{s['total_episodes']}"}
+                              for s in ongoing_sorted[:20]]  # Top 20 ongoing
+                },
+                "not_started": {
+                    "count": len(not_started_series),
+                    "titles": not_started_titles
+                }
+            },
+            "insights": {
+                "completion_distribution": stats.get("completion_distribution", {}),
+                "episode_ranges": episode_ranges,
+                "near_completion": completion_insights["near_completion"],
+                "stalled_series": completion_insights["stalled_series"],
+                "most_completed": stats.get("most_completed_series", [])[:10],
+                "least_completed": stats.get("least_completed_series", [])[:10]
+            },
+            "raw_data": {
+                "all_series": self.series_index,
+                "series_progress": series_progress
+            }
         }
         return report
         
@@ -680,3 +718,37 @@ class IndexManager:
         if sort_by:
             series_list.sort(key=lambda x: x.get(sort_by, 0), reverse=reverse)
         return series_list
+
+    def export_to_csv(self, filename=None):
+        """Export series data to CSV format for spreadsheet analysis"""
+        import csv
+        
+        if filename is None:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"series_export_{timestamp}.csv"
+        
+        filepath = os.path.join(DATA_DIR, filename)
+        series_progress = self.get_series_with_progress()
+        
+        with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['Title', 'Total_Episodes', 'Watched_Episodes', 'Unwatched_Episodes', 
+                         'Completion_Percentage', 'Status', 'Is_Empty']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for series in series_progress:
+                status = "Watched" if not series['is_incomplete'] else "Ongoing" if series['watched_episodes'] > 0 else "Not Started"
+                writer.writerow({
+                    'Title': series['title'],
+                    'Total_Episodes': series['total_episodes'],
+                    'Watched_Episodes': series['watched_episodes'],
+                    'Unwatched_Episodes': series['total_episodes'] - series['watched_episodes'],
+                    'Completion_Percentage': series['completion'],
+                    'Status': status,
+                    'Is_Empty': 'Yes' if series.get('empty', False) else 'No'
+                })
+        
+        print(f"✓ Exported {len(series_progress)} series to {filepath}")
+        return filepath
+
+

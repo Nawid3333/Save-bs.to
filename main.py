@@ -95,11 +95,12 @@ def show_menu():
     print("  2. Scrape only NEW series (faster)")
     print("  3. Add single series by URL")
     print("  4. Generate full report")
-    print("  5. Batch add series from text file")
-    print("  6. Retry failed series from last run")
-    print("  7. Pause current scraping (in another terminal)")
-    print("  8. Show active workers")
-    print("  9. Exit\n")
+    print("  5. Export data to CSV")
+    print("  6. Batch add series from text file")
+    print("  7. Retry failed series from last run")
+    print("  8. Pause current scraping (in another terminal)")
+    print("  9. Show active workers")
+    print(" 10. Exit\n")
 
 
 def scrape_series():
@@ -352,8 +353,6 @@ def batch_add_series_from_file():
     print("  The file should contain one URL per line")
     print("  Example format:")
     print("    https://bs.to/serie/Breaking-Bad")
-    print("    https://bs.to/serie/Game-of-Thrones")
-    print("    https://bs.to/serie/The-Wire\n")
     
     default_file = os.path.join(os.path.dirname(__file__), 'series_urls.txt')
     file_path = input(f"Enter file path [default: series_urls.txt]: ").strip().strip('"\'')
@@ -517,6 +516,29 @@ def show_active_workers():
         logger.error(f"Error reading workers from file {worker_pids_file}: {e}")
 
 
+def export_to_csv():
+    """Export series data to CSV file"""
+    try:
+        index_manager = IndexManager()
+        filepath = index_manager.export_to_csv()
+        print(f"\n✓ Data exported successfully!")
+        print(f"  File: {filepath}")
+        
+        # Ask if user wants to open the file
+        choice = input("\nOpen file location? (y/n): ").strip().lower()
+        if choice == 'y':
+            try:
+                if os.name == 'nt':  # Windows
+                    os.startfile(os.path.dirname(filepath))
+                else:  # Linux/Mac
+                    subprocess.run(['xdg-open', os.path.dirname(filepath)])
+            except Exception as e:
+                print(f"Could not open file location: {e}")
+        
+    except Exception as e:
+        print(f"✗ Error exporting to CSV: {str(e)}")
+
+
 def main():
     """Main application loop"""
     print_header()
@@ -542,14 +564,16 @@ def main():
         elif choice == '4':
             generate_report()
         elif choice == '5':
-            batch_add_series_from_file()
+            export_to_csv()
         elif choice == '6':
-            retry_failed_series()
+            batch_add_series_from_file()
         elif choice == '7':
-            pause_scraping()
+            retry_failed_series()
         elif choice == '8':
-            show_active_workers()
+            pause_scraping()
         elif choice == '9':
+            show_active_workers()
+        elif choice == '10':
             print("\n✓ Goodbye!\n")
             break
 
