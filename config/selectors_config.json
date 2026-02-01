@@ -31,20 +31,11 @@
         "value": "h2",
         "description": "Series title in h2 tag"
       },
-      "seasons_selector": {
-        "type": "id",
-        "value": "seasons",
-        "description": "Seasons dropdown container"
-      },
-      "season_links": {
+      "season_selector": {
         "type": "css",
         "value": "#seasons a",
-        "description": "Individual season links"
-      },
-      "season_watched_class": {
-        "full": "watched",
-        "none": "",
-        "description": "CSS class on season link: 'watched' = all episodes seen (green), no class = unwatched (grey), 'active' = partial/current"
+        "full_watched_class": "watched",
+        "description": "Season links selector: type=css, value=#seasons a, watched=green, unwatched=grey"
       }
     },
 

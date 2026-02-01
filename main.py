@@ -40,6 +40,42 @@ def print_header():
     print("="*60 + "\n")
 
 
+def print_scraped_series_status():
+    """Reload index and print status for all newly scraped/updated series"""
+    try:
+        index_manager = IndexManager()
+        index_manager.load_index()
+        
+        if not index_manager.series_index:
+            return
+        
+        # Show top updated/new series with their complete episode counts
+        series_list = list(index_manager.series_index.values())
+        if not series_list:
+            return
+        
+        # Sort by last updated (most recent first)
+        sorted_series = sorted(
+            series_list,
+            key=lambda s: s.get('last_updated', s.get('added_date', '')),
+            reverse=True
+        )
+        
+        # Show first 5 updated series
+        display_count = min(5, len(sorted_series))
+        if display_count > 0:
+            print("\n" + "-"*70)
+            print("EPISODE STATUS (from merged index):")
+            print("-"*70)
+            for s in sorted_series[:display_count]:
+                watched = s.get('watched_episodes', 0)
+                total = s.get('total_episodes', 0)
+                percent = round((watched / total * 100), 1) if total else 0
+                print(f"  • {s.get('title')}: {watched}/{total} episodes ({percent}%)")
+    except Exception as e:
+        logger.error(f"Error printing series status: {e}")
+
+
 def validate_credentials():
     """Validate that credentials are configured"""
     if not USERNAME or not PASSWORD:
@@ -100,6 +136,7 @@ def scrape_series():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Scraped data"):
                 print("\n✓ Scraping completed successfully!")
+                print_scraped_series_status()
                 logger.info("Scraping completed successfully")
         else:
             print("\n⚠ No data scraped")
@@ -129,6 +166,7 @@ def scrape_new_series():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "New series data"):
                 print("\n✓ New series scraping completed successfully!")
+                print_scraped_series_status()
                 logger.info("New series scraping completed successfully")
         else:
             print("\n⚠ No new series found")
@@ -269,6 +307,7 @@ def show_series_with_progress():
                     if scraper.series_data:
                         if confirm_and_save_changes(scraper.series_data, f"Rescrape data ({len(urls)} series)"):
                             print(f"\n✓ Rescrape completed! {len(urls)} series updated.")
+                            print_scraped_series_status()
                             logger.info(f"Rescraped {len(urls)} incomplete series")
                     else:
                         print("\n⚠ No data scraped")
@@ -500,6 +539,7 @@ def batch_add_series_from_file():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, f"Batch data ({len(urls)} series)"):
                 print(f"\n✓ Batch add completed! {len(urls)} series processed.")
+                print_scraped_series_status()
                 logger.info(f"Batch add completed: {len(urls)} series processed")
         else:
             print("\n⚠ No data scraped")
@@ -535,6 +575,7 @@ def retry_failed_series():
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Retry data"):
                 print("\n✓ Retry completed successfully!")
+                print_scraped_series_status()
                 logger.info(f"Retry completed successfully for {len(failed_list)} series")
         else:
             print("\n⚠ No data to retry")
