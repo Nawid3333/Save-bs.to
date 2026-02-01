@@ -80,6 +80,27 @@ atexit.register(cleanup_firefox)
 
 
 class BsToScraper:
+    def normalize_to_series_url(self, url):
+        """Given any bs.to URL (series, season, or episode), return the main series page URL."""
+        # Handles URLs like:
+        #   https://bs.to/serie/Series-Name
+        #   https://bs.to/serie/Series-Name/1/de
+        #   https://bs.to/serie/Series-Name/1/1/de
+        #   /serie/Series-Name/1/de
+        #   /serie/Series-Name/1/1/de
+        import re
+        # Remove protocol and domain if present
+        url = re.sub(r"^https?://[^/]+", "", url)
+        # Find the /serie/Series-Name part
+        m = re.match(r"(/serie/[^/]+)", url)
+        if m:
+            main_path = m.group(1)
+        else:
+            # fallback: if not matching, return as is
+            return url
+        # Always return full URL
+        site_url = self.get_site_url().rstrip("/")
+        return f"{site_url}{main_path}"
     """Config-based web scraper for BS.TO series"""
     
     def __init__(self):
@@ -537,6 +558,7 @@ class BsToScraper:
         else:
             season_elems = soup.find_all(season_value)
 
+        site_url = self.get_site_url()
         for elem in season_elems:
             label = elem.get_text(strip=True)
             href = elem.get('href', '')
@@ -553,14 +575,23 @@ class BsToScraper:
             if is_regular_season(label):
                 season_type_val = 'regular'
             else:
-                # Use the label as the type for specials (e.g., 'OVA', 'Special', 'Movie', etc.)
                 season_type_val = label
 
-            # Ensure proper URL construction
-            if href and not href.startswith('http') and not href.startswith('/'):
-                href = '/' + href
+            # Build correct season URL
+            season_url = ''
+            if href.startswith('http'):
+                season_url = href
+            elif href.startswith('/'):
+                season_url = site_url.rstrip('/') + href
+            elif href:
+                # relative, join with base_url
+                if not base_url.endswith('/'):
+                    base_url += '/'
+                season_url = base_url + href
+            else:
+                season_url = base_url
 
-            season_links.append((label, base_url.rstrip('/') + href if href and not href.startswith('http') else href, watched_status, season_type_val))
+            season_links.append((label, season_url, watched_status, season_type_val))
 
         # Deduplicate while preserving order
         seen = set()
@@ -684,117 +715,53 @@ class BsToScraper:
                 if len(season_item) == 4:
                     season_label, season_url, watched_status, season_type = season_item
                 elif len(season_item) == 3:
-                    season_label, season_url, watched_status = season_item
-                    season_type = 'regular' if is_regular_season(season_label) else season_label
-                else:
-                    season_label, season_url = season_item
-                    watched_status = "none"  # Unknown, needs loading
-                    season_type = 'regular' if is_regular_season(season_label) else season_label
-                
-                try:
-                    cached_season = existing_seasons.get(season_label)
-                    
-                    # Parallel mode: if we've confirmed series is unwatched, skip grey REGULAR seasons
-                    # Special seasons (OVA, Movies, Specials) are always checked individually
-                    if parallel_mode and assume_grey_unwatched and watched_status == 'none' and season_type == 'regular':
-                        if cached_season and cached_season.get('episodes'):
-                            # Use cached episodes, mark all unwatched
-                            episodes = []
-                            for ep in cached_season['episodes']:
-                                episodes.append({
-                                    'number': ep.get('number', ''),
-                                    'title': ep.get('title', ''),
-                                    'watched': False
-                                })
-                            watched_count = 0
-                            total_count = len(episodes)
-                            skipped_seasons += 1
+                    for idx, season_item in enumerate(season_links):
+                        # Handle new format (label, url, watched_status, season_type)
+                        if len(season_item) == 4:
+                            season_label, season_url, watched_status, season_type = season_item
+                        elif len(season_item) == 3:
+                            season_label, season_url, watched_status = season_item
+                            season_type = 'regular' if is_regular_season(season_label) else season_label
                         else:
-                            # No cache but we assume unwatched - still need to load for episode list
+                            season_label, season_url = season_item
+                            watched_status = "none"  # Unknown, needs loading
+                            season_type = 'regular' if is_regular_season(season_label) else season_label
+
+                        try:
+                            # Always load and scrape the season page, no cache or optimization
                             self.driver.get(season_url)
-                            # Wait for the page and episodes table to be fully loaded
-                            self.wait_for_css_element(self.driver, "body", timeout=10)
-                            self.wait_for_css_element(self.driver, "table.episodes", timeout=8)
-                            season_html = self.driver.page_source
-                            episodes = self.scrape_episodes_from_html(season_html)
-                            # Force all unwatched (we know series is unwatched)
-                            for ep in episodes:
-                                ep['watched'] = False
-                            watched_count = 0
-                            total_count = len(episodes)
-                    # Optimization: use cached data if available and status is definitive
-                    elif cached_season and cached_season.get('episodes'):
-                        cached_eps = cached_season['episodes']
-                        
-                        if watched_status == 'full':
-                            # Season is fully watched (green) - use cached episodes, mark all watched
-                            episodes = []
-                            for ep in cached_eps:
-                                episodes.append({
-                                    'number': ep.get('number', ''),
-                                    'title': ep.get('title', ''),
-                                    'watched': True  # Override to watched
-                                })
-                            watched_count = len(episodes)
-                            total_count = len(episodes)
-                            skipped_seasons += 1
-                        elif watched_status == 'none' and cached_season.get('watched_episodes', 0) == 0:
-                            # Season is unwatched (grey) AND was unwatched before - use cached
-                            episodes = []
-                            for ep in cached_eps:
-                                episodes.append({
-                                    'number': ep.get('number', ''),
-                                    'title': ep.get('title', ''),
-                                    'watched': False  # Keep unwatched
-                                })
-                            watched_count = 0
-                            total_count = len(episodes)
-                            skipped_seasons += 1
-                        else:
-                            # Status unclear or partial - must load to check
-                            self.driver.get(season_url)
-                            # Wait for the page and episodes table to be fully loaded
                             self.wait_for_css_element(self.driver, "body", timeout=10)
                             self.wait_for_css_element(self.driver, "table.episodes", timeout=8)
                             season_html = self.driver.page_source
                             episodes = self.scrape_episodes_from_html(season_html)
                             watched_count = sum(1 for ep in episodes if ep['watched'])
                             total_count = len(episodes)
-                    else:
-                        # No cached data - must load
-                        self.driver.get(season_url)
-                        # Wait for the page and episodes table to be fully loaded
-                        self.wait_for_css_element(self.driver, "body", timeout=10)
-                        self.wait_for_css_element(self.driver, "table.episodes", timeout=8)
-                        season_html = self.driver.page_source
-                        episodes = self.scrape_episodes_from_html(season_html)
-                        watched_count = sum(1 for ep in episodes if ep['watched'])
-                        total_count = len(episodes)
-                    
-                    # Parallel mode: after first grey season, check if all unwatched
-                    # If so, we can assume all subsequent grey seasons are unwatched too
-                    if parallel_mode and idx == 0 and watched_status == 'none' and watched_count == 0 and total_count > 0:
-                        assume_grey_unwatched = True
 
-                    seasons_data.append({
-                        "season": season_label,
-                        "url": season_url,
-                        "episodes": episodes,
-                        "watched_episodes": watched_count,
-                        "total_episodes": total_count
-                    })
+                            seasons_data.append({
+                                "season": season_label,
+                                "url": season_url,
+                                "episodes": episodes,
+                                "watched_episodes": watched_count,
+                                "total_episodes": total_count
+                            })
 
-                    total_watched += watched_count
-                    total_eps += total_count
-                except Exception as e:
-                    continue
-
-            # Derive link
-            link = series_hint.get('link') if series_hint else None
-            if not link:
+                            total_watched += watched_count
+                            total_eps += total_count
+                        except Exception as e:
+                            continue
+            # Robust link assignment
+            link = None
+            if series_hint and series_hint.get('link'):
+                link = series_hint.get('link')
+            else:
                 from urllib.parse import urlparse
+                import re
                 parsed = urlparse(url)
-                link = parsed.path or url
+                m = re.match(r'(/serie/[^/]+)', parsed.path)
+                if m:
+                    link = m.group(1)
+                else:
+                    link = parsed.path or url
             if not link.startswith('/'):
                 link = '/' + link
 
@@ -1561,16 +1528,20 @@ class BsToScraper:
     
     def scrape_single_series(self, url):
         """Scrape exactly one series (sequential, accurate)"""
-        print(f"→ Scraping single series: {url}")
-        result = self.process_series_page(url)
+        main_url = self.normalize_to_series_url(url)
+        print(f"→ Scraping single series (normalized): {main_url}")
+        result = self.process_series_page(main_url)
         self.series_data = [result]
         return result
     
     def scrape_multiple_series(self, urls):
         """Scrape multiple series from a list of URLs (sequential, accurate)"""
         print(f"→ Scraping {len(urls)} series from URL list (sequential mode)...")
-        # Convert URLs to series-like dicts for reuse of _scrape_series_sequential
-        series_list = [{'title': url.split('/')[-1], 'link': url, 'url': url} for url in urls]
+        # Normalize all URLs to main series page
+        series_list = []
+        for url in urls:
+            main_url = self.normalize_to_series_url(url)
+            series_list.append({'title': main_url.split('/')[-1], 'link': main_url, 'url': main_url})
         self.series_data = []
         self._scrape_series_sequential(series_list)
         print(f"  Successfully scraped: {len(self.series_data)}/{len(urls)} series")

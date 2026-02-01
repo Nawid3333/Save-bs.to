@@ -406,11 +406,31 @@ def add_series_by_url():
                     if not series:
                         series = next(iter(scraper.series_data.values()))
 
+                # After saving, reload the series from the index to get complete merged data
+                index_manager = IndexManager()
+                index_manager.load_index()
+                
+                # Find the scraped series in the index by title or link
+                series_in_index = None
                 if series:
+                    series_title = series.get('title')
+                    series_link = series.get('link')
+                    for indexed_series in index_manager.series_index.values():
+                        if indexed_series.get('title') == series_title or indexed_series.get('link') == series_link:
+                            series_in_index = indexed_series
+                            break
+                
+                if series_in_index:
+                    watched = series_in_index.get('watched_episodes', 0)
+                    total = series_in_index.get('total_episodes', 0)
+                    percent = round((watched / total * 100), 1) if total else 0
+                    print(f"\nStatus for '{series_in_index.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
+                elif series:
                     watched = series.get('watched_episodes', 0)
                     total = series.get('total_episodes', 0)
                     percent = round((watched / total * 100), 1) if total else 0
                     print(f"\nStatus for '{series.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
+                
                 print("\n✓ Series added/updated successfully!")
                 logger.info(f"Successfully added/updated series: {url}")
         else:
