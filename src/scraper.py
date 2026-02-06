@@ -228,8 +228,16 @@ class BsToScraper:
         
         return None
     
-    def wait_for_element(self, driver, selector_by, selector_value, timeout=None):
-        """Wait for element to be present and visible"""
+    def wait_for_element(self, driver, selector_by, selector_value, timeout=None, silent=False):
+        """Wait for element to be present and visible
+        
+        Args:
+            driver: Selenium WebDriver instance
+            selector_by: Selenium By selector type
+            selector_value: Selector value to find
+            timeout: Timeout in seconds (default from config)
+            silent: If True, don't print error messages on timeout
+        """
         if timeout is None:
             # Increase default timeout to 20 seconds for more reliability
             timeout = self.get_timing('timeout') or 20
@@ -239,12 +247,13 @@ class BsToScraper:
             )
             return True
         except Exception as e:
-            print(f"✗ Timeout or error waiting for element: {selector_value} ({e})")
+            if not silent:
+                print(f"✗ Timeout or error waiting for element: {selector_value} ({e})")
             return False
     
-    def wait_for_css_element(self, driver, css_selector, timeout=None):
+    def wait_for_css_element(self, driver, css_selector, timeout=None, silent=False):
         """Wait for CSS selector element to be present"""
-        return self.wait_for_element(driver, By.CSS_SELECTOR, css_selector, timeout)
+        return self.wait_for_element(driver, By.CSS_SELECTOR, css_selector, timeout, silent)
     
     # ==================== CHECKPOINT SYSTEM ====================
     
@@ -690,8 +699,8 @@ class BsToScraper:
             self.driver.get(url)
             # Wait for the body to be present and visible (ensures page is loaded)
             self.wait_for_css_element(self.driver, "body", timeout=10)
-            # Wait for title to appear (series title)
-            self.wait_for_css_element(self.driver, "h2", timeout=6)
+            # Wait for title to appear (series title) - silent since not all pages have h2
+            self.wait_for_css_element(self.driver, "h2", timeout=10, silent=True)
 
             page_content = self.driver.page_source
 
@@ -1271,8 +1280,8 @@ class BsToScraper:
         """
         try:
             driver.get(url)
-            # Wait for title to appear
-            self.wait_for_css_element(driver, "h2", timeout=3)
+            # Wait for title to appear - silent since not all pages have h2
+            self.wait_for_css_element(driver, "h2", timeout=10, silent=True)
             page_content = driver.page_source
             
             title_info = self.extract_series_title(page_content)
