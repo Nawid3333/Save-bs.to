@@ -158,13 +158,15 @@ def print_changes(old_data, new_data):
     return changes
 
 
-def display_changes(changes, include_unwatched=True, new_data=None):
+def display_changes(changes, include_unwatched=True, include_watched=True, new_data=None):
     """Display changes with pagination and smart season grouping"""
     total = 0
-    if include_unwatched:
-        total = sum(len(v) for v in changes.values())
-    else:
-        total = sum(len(v) for k, v in changes.items() if k != 'newly_unwatched')
+    for k, v in changes.items():
+        if k == 'newly_unwatched' and not include_unwatched:
+            continue
+        if k == 'newly_watched' and not include_watched:
+            continue
+        total += len(v)
     if total == 0:
         return 0
 
@@ -204,7 +206,7 @@ def display_changes(changes, include_unwatched=True, new_data=None):
             for x in changes["new_episodes"]:
                 print(f"  + {x[0]} [{x[1]}] Ep {x[2]}")
 
-    if changes["newly_watched"]:
+    if changes["newly_watched"] and include_watched:
         if new_data:
             grouped = defaultdict(list)
             for title, season, ep_num in changes["newly_watched"]:
@@ -441,8 +443,8 @@ def confirm_and_save_changes(new_data, description="data"):
         print(f"\n✓ {description} already up to date.")
         logging.info(f"No changes to save for {description}.")
         return True
-    # Display changes (without unwatched section, already handled above)
-    display_changes(changes, include_unwatched=False, new_data=new_dict)
+    # Display changes (without watched/unwatched sections, already handled above)
+    display_changes(changes, include_unwatched=False, include_watched=False, new_data=new_dict)
     # Ask for confirmation
     response = input(f"\nSave these changes? (y/n): ").strip().lower()
     if response != 'y':
