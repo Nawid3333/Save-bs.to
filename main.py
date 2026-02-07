@@ -95,12 +95,11 @@ def show_menu():
     print("  2. Scrape only NEW series (faster)")
     print("  3. Add single series by URL")
     print("  4. Generate full report")
-    print("  5. Export data to CSV")
-    print("  6. Batch add series from text file")
-    print("  7. Retry failed series from last run")
-    print("  8. Pause current scraping (in another terminal)")
-    print("  9. Show active workers")
-    print(" 10. Exit\n")
+    print("  5. Batch add series from text file")
+    print("  6. Retry failed series from last run")
+    print("  7. Pause current scraping (in another terminal)")
+    print("  8. Show active workers")
+    print("  9. Exit\n")
 
 
 def scrape_series():
@@ -200,8 +199,8 @@ def generate_report():
         print(f"\n  Total series:       {stats['total_series']}")
         print(f"  Watched (100%):     {stats['watched']}")
         
-        ongoing_count = len(report.get('ongoing', []))
-        not_started_count = len(report.get('not_started', []))
+        ongoing_count = report['categories']['ongoing']['count']
+        not_started_count = report['categories']['not_started']['count']
         print(f"  Ongoing (started):  {ongoing_count}")
         print(f"  Not started:        {not_started_count}")
         print(f"  Generated:          {meta['generated']}")
@@ -209,7 +208,8 @@ def generate_report():
         # Show ongoing series (started but incomplete)
         if ongoing_count > 0:
             print(f"\n📺 ONGOING SERIES ({ongoing_count}):")
-            for title in report['ongoing'][:10]:
+            ongoing_titles = report['categories']['ongoing']['titles']
+            for title in ongoing_titles[:10]:
                 print(f"  • {title}")
             if ongoing_count > 10:
                 print(f"  ... and {ongoing_count - 10} more\n")
@@ -220,7 +220,8 @@ def generate_report():
                 try:
                     # Get URLs for ongoing series from the index
                     urls = []
-                    for title in report['ongoing']:
+                    ongoing_titles = report['categories']['ongoing']['titles']
+                    for title in ongoing_titles:
                         series_data = manager.series_index.get(title, {})
                         url = series_data.get('url') or series_data.get('link')
                         if url:
@@ -516,29 +517,6 @@ def show_active_workers():
         logger.error(f"Error reading workers from file {worker_pids_file}: {e}")
 
 
-def export_to_csv():
-    """Export series data to CSV file"""
-    try:
-        index_manager = IndexManager()
-        filepath = index_manager.export_to_csv()
-        print(f"\n✓ Data exported successfully!")
-        print(f"  File: {filepath}")
-        
-        # Ask if user wants to open the file
-        choice = input("\nOpen file location? (y/n): ").strip().lower()
-        if choice == 'y':
-            try:
-                if os.name == 'nt':  # Windows
-                    os.startfile(os.path.dirname(filepath))
-                else:  # Linux/Mac
-                    subprocess.run(['xdg-open', os.path.dirname(filepath)])
-            except Exception as e:
-                print(f"Could not open file location: {e}")
-        
-    except Exception as e:
-        print(f"✗ Error exporting to CSV: {str(e)}")
-
-
 def main():
     """Main application loop"""
     print_header()
@@ -564,16 +542,14 @@ def main():
         elif choice == '4':
             generate_report()
         elif choice == '5':
-            export_to_csv()
-        elif choice == '6':
             batch_add_series_from_file()
-        elif choice == '7':
+        elif choice == '6':
             retry_failed_series()
-        elif choice == '8':
+        elif choice == '7':
             pause_scraping()
-        elif choice == '9':
+        elif choice == '8':
             show_active_workers()
-        elif choice == '10':
+        elif choice == '9':
             print("\n✓ Goodbye!\n")
             break
 

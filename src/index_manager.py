@@ -721,36 +721,6 @@ class IndexManager:
             series_list.sort(key=lambda x: x.get(sort_by, 0), reverse=reverse)
         return series_list
 
-    def export_to_csv(self, filename=None):
-        """Export series data to CSV format for spreadsheet analysis"""
-        import csv
-        
-        if filename is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"series_export_{timestamp}.csv"
-        
-        filepath = os.path.join(DATA_DIR, filename)
-        series_progress = self.get_series_with_progress()
-        
-        with open(filepath, 'w', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Title', 'Total_Episodes', 'Watched_Episodes', 'Unwatched_Episodes', 
-                         'Completion_Percentage', 'Status', 'Is_Empty']
-            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-            
-            writer.writeheader()
-            for series in series_progress:
-                status = "Watched" if not series['is_incomplete'] else "Ongoing" if series['watched_episodes'] > 0 else "Not Started"
-                writer.writerow({
-                    'Title': series['title'],
-                    'Total_Episodes': series['total_episodes'],
-                    'Watched_Episodes': series['watched_episodes'],
-                    'Unwatched_Episodes': series['total_episodes'] - series['watched_episodes'],
-                    'Completion_Percentage': series['completion'],
-                    'Status': status,
-                    'Is_Empty': 'Yes' if series.get('empty', False) else 'No'
-                })
-        
-        print(f"✓ Exported {len(series_progress)} series to {filepath}")
-        return filepath
+
 
 
