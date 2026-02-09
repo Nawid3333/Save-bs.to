@@ -44,7 +44,6 @@ def print_scraped_series_status():
     """Reload index and print status for all newly scraped/updated series"""
     try:
         index_manager = IndexManager()
-        index_manager.load_index()
         
         if not index_manager.series_index:
             return
@@ -309,7 +308,6 @@ def add_series_by_url():
 
                 # After saving, reload the series from the index to get complete merged data
                 index_manager = IndexManager()
-                index_manager.load_index()
                 
                 # Find the scraped series in the index by title or link
                 series_in_index = None
