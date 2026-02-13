@@ -62,11 +62,18 @@
   },
 
   "timing": {
-    "page_load_delay": 0.2,
-    "action_delay": 0.1,
-    "season_load_delay": 0.2,
-    "login_delay": 0.2,
-    "initial_delay": 0.5,
-    "timeout": 8
+    "page_load_delay": 0.8,
+    "action_delay": 0.3,
+    "season_load_delay": 0.5,
+    "login_delay": 0.5,
+    "initial_delay": 1.0,
+    "timeout": 15,
+    "success_delay": 0.3,
+    "error_backoff_base": 1.0,
+    "error_backoff_max": 8.0,
+    "health_check_every": 15,
+    "error_restart_threshold": 8,
+    "max_retries_season": 3,
+    "max_retries_retry": 5
   }
 }
