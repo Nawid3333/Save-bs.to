@@ -41,14 +41,10 @@ def is_regular_season(season_label):
     return bool(re.search(r'^(staffel|season|s)?\s*\d+$', season_label.strip(), re.IGNORECASE))
 
 
-def cleanup_firefox():
-    """Kill only tracked geckodriver processes (Selenium-spawned Firefox only).
-    
-    IMPORTANT: This only kills geckodriver.exe by PID, NOT firefox.exe.
-    Personal Firefox browser instances are never touched.
-    """
+def cleanup_geckodriver_processes():
+    """Clean up only the geckodriver processes we spawned (safe for personal Firefox)"""
     try:
-        # Try to load tracked worker PIDs
+        # Load tracked worker PIDs
         worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
         if os.path.exists(worker_pids_file):
             try:
@@ -64,23 +60,18 @@ def cleanup_firefox():
                             pass
             except Exception:
                 pass
-        
-        # Fallback: kill all geckodriver processes (safer than firefox.exe)
-        if sys.platform == 'win32':
-            os.system('taskkill /F /IM geckodriver.exe /T 2>nul')
-        else:
-            os.system('pkill -9 geckodriver 2>/dev/null')
-    except Exception as e:
+    except Exception:
         pass
 
 
-# Register cleanup on exit
-atexit.register(cleanup_firefox)
+# Register safe cleanup on exit
+atexit.register(cleanup_geckodriver_processes)
 
 
 class BsToScraper:
+    """Config-based web scraper for BS.TO series"""
+    
     def normalize_to_series_url(self, url):
-        """Given any bs.to URL (series, season, or episode), return the main series page URL."""
         # Handles URLs like:
         #   https://bs.to/serie/Series-Name
         #   https://bs.to/serie/Series-Name/1/de
@@ -100,7 +91,6 @@ class BsToScraper:
         # Always return full URL
         site_url = self.get_site_url().rstrip("/")
         return f"{site_url}{main_path}"
-    """Config-based web scraper for BS.TO series"""
     
     def __init__(self):
         self.driver = None
@@ -113,7 +103,6 @@ class BsToScraper:
         self.worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
         self.completed_links = set()
         self.failed_links = []
-        self.failed_seasons = []  # Track failed seasons for retry
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
         
         if not self.config:
@@ -193,6 +182,21 @@ class BsToScraper:
     def get_login_page(self):
         """Get login page URL from config"""
         return self.config.get('login_page', 'https://bs.to/login')
+    
+    def parse_season_item(self, season_item):
+        """Parse season item tuple into components, handling different tuple lengths"""
+        # Handle new format (label, url, watched_status, season_type)
+        if len(season_item) == 4:
+            season_label, season_url, watched_status, season_type = season_item
+        elif len(season_item) == 3:
+            season_label, season_url, watched_status = season_item
+            season_type = 'regular' if is_regular_season(season_label) else season_label
+        else:
+            season_label, season_url = season_item
+            watched_status = "none"  # Unknown, needs loading
+            season_type = 'regular' if is_regular_season(season_label) else season_label
+        
+        return season_label, season_url, watched_status, season_type
     
     # ==================== ELEMENT FINDING ====================
     
@@ -395,7 +399,6 @@ class BsToScraper:
             except Exception:
                 pass
             print("✓ Browser closed")
-        cleanup_firefox()
     
     # ==================== AUTHENTICATION ====================
     
@@ -456,6 +459,9 @@ class BsToScraper:
 
             # Wait for body to fully load
             self.wait_for_css_element(self.driver, "body", timeout=3)
+            
+            # Additional delay after login for page stabilization
+            time.sleep(self.get_timing('login_delay'))
             
             # Verify login with markers from config
             if self.is_logged_in(self.driver):
@@ -546,7 +552,7 @@ class BsToScraper:
         """Extract season links from season selector (includes specials/season 0)
         
         Returns list of tuples: (label, href, watched_status, season_type)
-        watched_status: 'full' = all watched (green), 'none' = unwatched (grey), 'partial' = needs loading
+        watched_status: 'full' = all watched (green), 'none' = unwatched (grey)
         season_type: 'regular' for numbered seasons, or the special label (e.g., 'OVA', 'Special', 'Movie', etc.)
         """
         soup = BeautifulSoup(html, 'html.parser')
@@ -685,17 +691,21 @@ class BsToScraper:
     
     # ==================== SERIES PROCESSING ====================
     
-    def process_series_page(self, url, series_hint=None, existing_entry=None, parallel_mode=False):
-        """Navigate to series page, extract title and all seasons/episodes
-        
-        Optimization: Uses cached episode data when season watched status matches:
-        - Green (fully watched) + cached data → reuse cached episodes, mark all watched
-        - Grey (unwatched) + cached data → reuse cached episodes, mark all unwatched
-        
-        Parallel mode optimization:
-        - If Season 1 is grey AND all its episodes are unwatched, assume all subsequent
-          grey seasons are also unwatched (saves page loads for completely unwatched series)
+    def check_series_not_found_error(self, html):
         """
+        Check if page contains German error message for series not found
+        Returns error message if found, None otherwise
+        """
+        soup = BeautifulSoup(html, 'html.parser')
+        error_div = soup.find('div', class_='messageBox error')
+        if error_div:
+            error_text = error_div.get_text(strip=True)
+            if 'nicht gefunden' in error_text.lower():
+                return error_text
+        return None
+    
+    def process_series_page(self, url, series_hint=None, existing_entry=None, parallel_mode=False):
+        """Navigate to series page, extract title and all seasons/episodes"""
         try:
             self.driver.get(url)
             # Wait for the body to be present and visible (ensures page is loaded)
@@ -705,47 +715,62 @@ class BsToScraper:
 
             page_content = self.driver.page_source
 
+            # Check for German error message "Serie nicht gefunden!" (Series not found)
+            # This indicates an invalid or removed series
+            error_found = self.check_series_not_found_error(page_content)
+            if error_found:
+                print(f"✗ Series not found: {url} - {error_found}")
+                return {
+                    'title': f'[ERROR: {error_found}]',
+                    'url': url,
+                    'total_episodes': 0,
+                    'watched_episodes': 0,
+                    'seasons': [],
+                    'error': error_found,
+                    'empty': True
+                }
+
             # Extract title
             title_info = self.extract_series_title(page_content)
             title_value = title_info if title_info else None
+
+            # Skip utility/navigation pages that somehow got through filtering
+            if title_value:
+                title_normalized = title_value.lower().strip()
+                utility_pages = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
+                if title_normalized in utility_pages or any(keyword in title_normalized for keyword in utility_pages):
+                    print(f"⚠ Skipping utility page: '{title_value}' (URL: {url})")
+                    return {
+                        'title': title_value,
+                        'url': url,
+                        'total_episodes': 0,
+                        'watched_episodes': 0,
+                        'seasons': []
+                    }
 
             # Get season links (including specials) with watched status
             season_links = self.get_season_links(page_content, url)
             if not season_links:
                 season_links = [("1", url, "none")]  # Default: needs loading
 
-            # Build lookup for existing seasons by label
-            existing_seasons = {}
-            if existing_entry and existing_entry.get('seasons'):
-                for s in existing_entry['seasons']:
-                    existing_seasons[s.get('season')] = s
-
             seasons_data = []
             total_watched = 0
             total_eps = 0
-            skipped_seasons = 0
 
             for idx, season_item in enumerate(season_links):
-                # Handle new format (label, url, watched_status, season_type)
-                if len(season_item) == 4:
-                    season_label, season_url, watched_status, season_type = season_item
-                elif len(season_item) == 3:
-                    season_label, season_url, watched_status = season_item
-                    season_type = 'regular' if is_regular_season(season_label) else season_label
-                else:
-                    season_label, season_url = season_item
-                    watched_status = "none"  # Unknown, needs loading
-                    season_type = 'regular' if is_regular_season(season_label) else season_label
+                # Parse season item into components
+                season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
                     # Always load and scrape the season page, no cache or optimization
-                    max_retries = 3
+                    max_retries = self.get_timing('max_retries_season') or 3
                     episodes = []
                     season_failed = True
                     
                     for attempt in range(max_retries):
                         try:
                             self.driver.get(season_url)
+                            time.sleep(self.get_timing('season_load_delay'))
                             self.wait_for_css_element(self.driver, "body", timeout=10)
                             # Make retries silent except for the final attempt
                             silent = attempt < max_retries - 1
@@ -764,15 +789,6 @@ class BsToScraper:
                                 time.sleep(2)
                             else:
                                 print(f"✗ Failed to load season {season_label} after {max_retries} attempts: {inner_e}")
-                    
-                    # Track failed seasons for later retry
-                    if season_failed:
-                        self.failed_seasons.append({
-                            'series_url': url,
-                            'season_label': season_label,
-                            'season_url': season_url,
-                            'series_title': title_value
-                        })
                     
                     watched_count = sum(1 for ep in episodes if ep['watched'])
                     total_count = len(episodes)
@@ -811,8 +827,7 @@ class BsToScraper:
                 "url": url,
                 "seasons": seasons_data,
                 "watched_episodes": total_watched,
-                "total_episodes": total_eps,
-                "skipped_seasons": skipped_seasons  # For stats
+                "total_episodes": total_eps
             }
         except Exception as e:
             raise Exception(f"Series processing failed for {url}: {str(e)}")
@@ -853,6 +868,9 @@ class BsToScraper:
     def scrape_series_list(self):
         """Scrape all TV series"""
         try:
+            # Initial delay before starting scraping
+            time.sleep(self.get_timing('initial_delay'))
+            
             all_series = self.get_all_series()
 
             if USE_PARALLEL:
@@ -929,7 +947,6 @@ class BsToScraper:
         start_time = time.time()
         completed = 0
         failed = 0
-        skipped_seasons_total = 0
         lock = threading.Lock()
         auth_lock = threading.Lock()  # Serialize worker authentication
         stop_event = threading.Event()
@@ -969,7 +986,7 @@ class BsToScraper:
                 print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ✓ {title}{ep_info}")
 
         def worker_loop(worker_id, my_series_list):
-            nonlocal completed, failed, skipped_seasons_total
+            nonlocal completed, failed
             driver = self._create_worker_driver(worker_id)
             success_delay = self.get_timing('success_delay') or 0.2
             backoff_base = self.get_timing('error_backoff_base') or 0.5
@@ -1031,7 +1048,6 @@ class BsToScraper:
                     result = self._process_series_with_driver(driver, series['url'], series, existing_entry=None)
                     with lock:
                         if result:
-                            skipped_seasons_total += result.get('skipped_seasons', 0)
                             empty = result.get('total_episodes', 0) == 0
                             result['empty'] = empty
                             self.series_data.append(result)
@@ -1044,6 +1060,7 @@ class BsToScraper:
                             progress_line(completed, total_series, result.get('title', 'Series'), watched=watched, episode_total=total_eps, empty=empty, worker_id=worker_id)
                             error_streak = 0
                             tasks_since_check += 1
+                            
                         else:
                             failed += 1
                             progress_line(completed, total_series, series.get('title', 'Series'), error='skipped', worker_id=worker_id)
@@ -1149,116 +1166,68 @@ class BsToScraper:
         total_time = time.time() - start_time
         total_mins = int(total_time / 60)
         total_secs = int(total_time % 60)
-        skip_info = f" | {skipped_seasons_total} season pages skipped (cached)" if skipped_seasons_total > 0 else ""
         if failed:
-            print(f"\n✓ Completed in {total_mins}m {total_secs}s ({failed} failed){skip_info}", flush=True)
+            print(f"\n✓ Completed in {total_mins}m {total_secs}s ({failed} failed)", flush=True)
         else:
-            print(f"\n✓ Completed in {total_mins}m {total_secs}s{skip_info}", flush=True)
+            print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
         
-        # Retry failed seasons after main scraping
-        if self.failed_seasons:
-            print(f"\n🔄 Retrying {len(self.failed_seasons)} failed seasons...")
-            self._retry_failed_seasons()
+        # Offer retry for failed series only
+        if self.failed_links:
+            try:
+                response = input(f"Retry {len(self.failed_links)} failed series? (y/n): ").strip().lower()
+                if response in ['y', 'yes']:
+                    print(f"\n🔄 Retrying {len(self.failed_links)} failed series...")
+                    self._retry_failed_series()
+                else:
+                    print("Skipping series retries.")
+                    self.save_failed_series()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSkipping series retries due to input interruption.")
+                self.save_failed_series()
     
-    def _retry_failed_seasons(self):
-        """Retry scraping failed seasons with more aggressive settings"""
-        if not self.failed_seasons:
+
+    
+    def _retry_failed_series(self):
+        """Retry scraping failed series with more aggressive settings"""
+        if not self.failed_links:
             return
         
-        print(f"  → Using more aggressive retry settings (5 attempts, longer timeouts)")
+        print(f"  → Using more aggressive retry settings for series")
         
-        # Create a dedicated driver for retrying
-        retry_driver = self._create_worker_driver(worker_id="retry")
-        
-        try:
-            # Login once for the retry session
-            self._login_with_driver(retry_driver)
-            
-            successful_retries = 0
-            for failed_season in self.failed_seasons[:]:  # Copy to avoid modification during iteration
-                try:
-                    series_url = failed_season['series_url']
-                    season_label = failed_season['season_label']
-                    season_url = failed_season['season_url']
-                    series_title = failed_season.get('series_title', 'Unknown')
-                    
-                    print(f"  🔄 Retrying {series_title} - {season_label}...")
-                    
-                    # More aggressive retry: 5 attempts, longer timeouts
-                    max_retries = 5
-                    episodes = []
-                    
-                    for attempt in range(max_retries):
-                        try:
-                            retry_driver.get(season_url)
-                            self.wait_for_css_element(retry_driver, "body", timeout=15)
-                            # Silent retries except final attempt
-                            silent = attempt < max_retries - 1
-                            if self.wait_for_css_element(retry_driver, "table.episodes", timeout=30 + attempt * 10, silent=silent):
-                                season_html = retry_driver.page_source
-                                episodes = self.scrape_episodes_from_html(season_html)
-                                break
-                            else:
-                                if attempt < max_retries - 1:
-                                    print(f"    ⚠ Retry {attempt + 2}/{max_retries} for {season_label}")
-                                    time.sleep(3)  # Longer pause between retries
-                        except Exception as inner_e:
-                            if attempt < max_retries - 1:
-                                print(f"    ⚠ Error retry {attempt + 2}/{max_retries}: {inner_e}")
-                                time.sleep(3)
-                            else:
-                                print(f"    ✗ Final failure for {season_label}: {inner_e}")
-                    
-                    if episodes:
-                        # Find the series in series_data and update the season
-                        for series_entry in self.series_data:
-                            if series_entry.get('url') == series_url:
-                                # Find and update the season
-                                for season in series_entry.get('seasons', []):
-                                    if season.get('season') == season_label:
-                                        season['episodes'] = episodes
-                                        season['watched_episodes'] = sum(1 for ep in episodes if ep['watched'])
-                                        season['total_episodes'] = len(episodes)
-                                        # Recalculate series totals
-                                        series_entry['watched_episodes'] = sum(s.get('watched_episodes', 0) for s in series_entry['seasons'])
-                                        series_entry['total_episodes'] = sum(s.get('total_episodes', 0) for s in series_entry['seasons'])
-                                        print(f"    ✓ Successfully recovered {len(episodes)} episodes for {season_label}")
-                                        successful_retries += 1
-                                        break
-                                break
-                        
-                        # Remove from failed list
-                        self.failed_seasons.remove(failed_season)
-                    else:
-                        print(f"    ✗ Could not recover {season_label} after {max_retries} attempts")
-                        
-                except Exception as e:
-                    print(f"    ✗ Unexpected error retrying {season_label}: {e}")
-                    continue
-            
-            if successful_retries > 0:
-                print(f"\n✓ Recovered {successful_retries} seasons from {len(self.failed_seasons) + successful_retries} failed attempts")
-            
-            if self.failed_seasons:
-                print(f"⚠ {len(self.failed_seasons)} seasons still failed. Consider manual checking or running again later.")
-                # Save remaining failed seasons for future retry
-                self._save_failed_seasons_to_file()
-        
-        finally:
+        successful_retries = 0
+        for failed_series in self.failed_links[:]:  # Copy to avoid modification during iteration
             try:
-                retry_driver.quit()
-            except Exception:
-                pass
-    
-    def _save_failed_seasons_to_file(self):
-        """Save remaining failed seasons to file for future retry"""
-        try:
-            failed_seasons_file = os.path.join(DATA_DIR, '.failed_seasons.json')
-            with open(failed_seasons_file, 'w', encoding='utf-8') as f:
-                json.dump(self.failed_seasons, f, ensure_ascii=False, indent=2)
-            print(f"  → Failed seasons saved to {failed_seasons_file}")
-        except Exception as e:
-            print(f"  ⚠ Could not save failed seasons: {e}")
+                series_title = failed_series.get('title', 'Unknown')
+                series_url = failed_series.get('url', failed_series.get('link', ''))
+                
+                print(f"  🔄 Retrying series: {series_title}...")
+                
+                # Try to scrape the series again
+                result = self._process_series_with_driver(None, series_url, failed_series)
+                
+                if result and result.get('seasons'):
+                    # Success! Add to series_data
+                    self.series_data.append(result)
+                    self.completed_links.add(failed_series.get('link'))
+                    successful_retries += 1
+                    print(f"    ✓ Successfully recovered {len(result.get('seasons', []))} seasons for {series_title}")
+                    
+                    # Remove from failed list
+                    self.failed_links.remove(failed_series)
+                else:
+                    print(f"    ✗ Could not recover {series_title}")
+                        
+            except Exception as e:
+                print(f"    ✗ Unexpected error retrying {series_title}: {e}")
+                continue
+        
+        if successful_retries > 0:
+            print(f"\n✓ Recovered {successful_retries} series from {len(self.failed_links) + successful_retries} failed attempts")
+        
+        if self.failed_links:
+            print(f"⚠ {len(self.failed_links)} series still failed. Consider manual checking or running again later.")
+            # Save remaining failed series
+            self.save_failed_series()
     
     def _scrape_series_worker(self, series):
         """Worker for parallel processing"""
@@ -1404,16 +1373,7 @@ class BsToScraper:
             raise Exception(f"Worker login failed: {str(e)}")
     
     def _process_series_with_driver(self, driver, url, series_hint=None, existing_entry=None):
-        """Process series using specific driver (used by parallel workers)
-        
-        Optimization: Uses cached episode data when season watched status matches:
-        - Green (fully watched) + cached data → reuse cached episodes, mark all watched
-        - Grey (unwatched) + cached data with 0 watched → reuse cached, keep unwatched
-        
-        Parallel mode optimization:
-        - If Season 1 is grey AND all its episodes are unwatched, assume all subsequent
-          grey seasons are also unwatched (saves page loads for completely unwatched series)
-        """
+        """Process series using specific driver (used by parallel workers)"""
         try:
             driver.get(url)
             # Wait for title to appear - silent since not all pages have h2
@@ -1423,52 +1383,74 @@ class BsToScraper:
             title_info = self.extract_series_title(page_content)
             title_value = title_info if title_info else None
             
+            # Skip utility/navigation pages that somehow got through filtering
+            if title_value:
+                title_normalized = title_value.lower().strip()
+                utility_pages = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
+                if title_normalized in utility_pages or any(keyword in title_normalized for keyword in utility_pages):
+                    print(f"⚠ Skipping utility page: '{title_value}' (URL: {url})")
+                    return {
+                        'title': title_value,
+                        'url': url,
+                        'total_episodes': 0,
+                        'watched_episodes': 0,
+                        'seasons': []
+                    }
+            
             season_links = self.get_season_links(page_content, url)
             if not season_links:
                 season_links = [("1", url, "none")]
             
-            # Build lookup for existing seasons by label
-            existing_seasons = {}
-            if existing_entry and existing_entry.get('seasons'):
-                for s in existing_entry['seasons']:
-                    existing_seasons[s.get('season')] = s
-            
             seasons_data = []
             total_watched = 0
             total_eps = 0
-            skipped_seasons = 0
 
             for idx, season_item in enumerate(season_links):
-                # Handle new format (label, url, watched_status, season_type)
-                if len(season_item) == 4:
-                    season_label, season_url, watched_status, season_type = season_item
-                elif len(season_item) == 3:
-                    season_label, season_url, watched_status = season_item
-                    season_type = 'regular' if is_regular_season(season_label) else season_label
-                else:
-                    season_label, season_url = season_item
-                    watched_status = "none"
-                    season_type = 'regular' if is_regular_season(season_label) else season_label
+                # Parse season item into components
+                season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
                     # Always load and scrape the season page, no cache or optimization
-                    driver.get(season_url)
-                    self.wait_for_css_element(driver, "table.episodes", timeout=20)
-                    season_html = driver.page_source
-                    episodes = self.scrape_episodes_from_html(season_html)
-                    watched_count = sum(1 for ep in episodes if ep['watched'])
-                    total_count = len(episodes)
+                    max_retries = self.get_timing('max_retries_season') or 3
+                    episodes = []
+                    season_failed = True
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            driver.get(season_url)
+                            time.sleep(self.get_timing('season_load_delay'))
+                            self.wait_for_css_element(driver, "body", timeout=10)
+                            # Make retries silent except for the final attempt
+                            silent = attempt < max_retries - 1
+                            if self.wait_for_css_element(driver, "table.episodes", timeout=20 + attempt * 5, silent=silent):
+                                season_html = driver.page_source
+                                episodes = self.scrape_episodes_from_html(season_html)
+                                season_failed = False
+                                break
+                            else:
+                                if attempt < max_retries - 1:
+                                    time.sleep(2)  # Brief pause before retry
+                        except Exception as inner_e:
+                            if attempt < max_retries - 1:
+                                time.sleep(2)
+                            else:
+                                # Final failure - continue to next season
+                                break
+                    
+                    if not season_failed and episodes:
+                        watched_count = sum(1 for ep in episodes if ep['watched'])
+                        total_count = len(episodes)
 
-                    seasons_data.append({
-                        "season": season_label,
-                        "url": season_url,
-                        "episodes": episodes,
-                        "watched_episodes": watched_count,
-                        "total_episodes": total_count
-                    })
+                        seasons_data.append({
+                            "season": season_label,
+                            "url": season_url,
+                            "episodes": episodes,
+                            "watched_episodes": watched_count,
+                            "total_episodes": total_count
+                        })
 
-                    total_watched += watched_count
-                    total_eps += total_count
+                        total_watched += watched_count
+                        total_eps += total_count
                 except Exception as e:
                     continue
             
@@ -1486,8 +1468,7 @@ class BsToScraper:
                 "url": url,
                 "seasons": seasons_data,
                 "watched_episodes": total_watched,
-                "total_episodes": total_eps,
-                "skipped_seasons": skipped_seasons
+                "total_episodes": total_eps
             }
         except Exception as e:
             raise Exception(f"Series processing failed for {url}: {str(e)}")
@@ -1511,6 +1492,9 @@ class BsToScraper:
     
     def scrape_new_series_only(self):
         """Scrape only new series not in index"""
+        # Initial delay before starting scraping
+        time.sleep(self.get_timing('initial_delay'))
+        
         all_series = self.get_all_series()
         existing_links = self.load_existing_links()
         # Also load the full index to check for 'empty' flag
@@ -1548,6 +1532,9 @@ class BsToScraper:
             self.scrape_series_list()
             return
         
+        # Initial delay before resuming scraping
+        time.sleep(self.get_timing('initial_delay'))
+        
         all_series = self.get_all_series()
         remaining_series = [s for s in all_series if s.get('link') not in self.completed_links]
         
@@ -1583,6 +1570,9 @@ class BsToScraper:
     
     def scrape_single_series(self, url):
         """Scrape exactly one series (sequential, accurate)"""
+        # Initial delay before starting scraping
+        time.sleep(self.get_timing('initial_delay'))
+        
         main_url = self.normalize_to_series_url(url)
         print(f"→ Scraping single series (normalized): {main_url}")
         result = self.process_series_page(main_url)
@@ -1591,6 +1581,9 @@ class BsToScraper:
     
     def scrape_multiple_series(self, urls):
         """Scrape multiple series from a list of URLs (sequential, accurate)"""
+        # Initial delay before starting scraping
+        time.sleep(self.get_timing('initial_delay'))
+        
         print(f"→ Scraping {len(urls)} series from URL list (sequential mode)...")
         # Normalize all URLs to main series page
         series_list = []
