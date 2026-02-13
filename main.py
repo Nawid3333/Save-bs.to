@@ -527,9 +527,9 @@ def main():
     
     while True:
         show_menu()
-        choice = input("Enter your choice (1-10): ").strip()
-        if not choice.isdigit() or not (1 <= int(choice) <= 10):
-            print("✗ Invalid choice. Please enter a number between 1 and 10.")
+        choice = input("Enter your choice (1-9): ").strip()
+        if not choice.isdigit() or not (1 <= int(choice) <= 9):
+            print("✗ Invalid choice. Please enter a number between 1 and 9.")
             continue
         if choice == '1':
             scrape_series()
