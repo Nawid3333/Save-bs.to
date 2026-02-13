@@ -113,6 +113,7 @@ class BsToScraper:
         self.worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
         self.completed_links = set()
         self.failed_links = []
+        self.failed_seasons = []  # Track failed seasons for retry
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
         
         if not self.config:
@@ -738,11 +739,41 @@ class BsToScraper:
 
                 try:
                     # Always load and scrape the season page, no cache or optimization
-                    self.driver.get(season_url)
-                    self.wait_for_css_element(self.driver, "body", timeout=10)
-                    self.wait_for_css_element(self.driver, "table.episodes", timeout=20)
-                    season_html = self.driver.page_source
-                    episodes = self.scrape_episodes_from_html(season_html)
+                    max_retries = 3
+                    episodes = []
+                    season_failed = True
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            self.driver.get(season_url)
+                            self.wait_for_css_element(self.driver, "body", timeout=10)
+                            # Make retries silent except for the final attempt
+                            silent = attempt < max_retries - 1
+                            if self.wait_for_css_element(self.driver, "table.episodes", timeout=20 + attempt * 5, silent=silent):
+                                season_html = self.driver.page_source
+                                episodes = self.scrape_episodes_from_html(season_html)
+                                season_failed = False
+                                break
+                            else:
+                                if attempt < max_retries - 1:
+                                    print(f"⚠ Retrying season {season_label} (attempt {attempt + 2}/{max_retries})")
+                                    time.sleep(2)  # Brief pause before retry
+                        except Exception as inner_e:
+                            if attempt < max_retries - 1:
+                                print(f"⚠ Error loading season {season_label}, retrying (attempt {attempt + 2}/{max_retries}): {inner_e}")
+                                time.sleep(2)
+                            else:
+                                print(f"✗ Failed to load season {season_label} after {max_retries} attempts: {inner_e}")
+                    
+                    # Track failed seasons for later retry
+                    if season_failed:
+                        self.failed_seasons.append({
+                            'series_url': url,
+                            'season_label': season_label,
+                            'season_url': season_url,
+                            'series_title': title_value
+                        })
+                    
                     watched_count = sum(1 for ep in episodes if ep['watched'])
                     total_count = len(episodes)
 
@@ -1123,6 +1154,111 @@ class BsToScraper:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s ({failed} failed){skip_info}", flush=True)
         else:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s{skip_info}", flush=True)
+        
+        # Retry failed seasons after main scraping
+        if self.failed_seasons:
+            print(f"\n🔄 Retrying {len(self.failed_seasons)} failed seasons...")
+            self._retry_failed_seasons()
+    
+    def _retry_failed_seasons(self):
+        """Retry scraping failed seasons with more aggressive settings"""
+        if not self.failed_seasons:
+            return
+        
+        print(f"  → Using more aggressive retry settings (5 attempts, longer timeouts)")
+        
+        # Create a dedicated driver for retrying
+        retry_driver = self._create_worker_driver(worker_id="retry")
+        
+        try:
+            # Login once for the retry session
+            self._login_with_driver(retry_driver)
+            
+            successful_retries = 0
+            for failed_season in self.failed_seasons[:]:  # Copy to avoid modification during iteration
+                try:
+                    series_url = failed_season['series_url']
+                    season_label = failed_season['season_label']
+                    season_url = failed_season['season_url']
+                    series_title = failed_season.get('series_title', 'Unknown')
+                    
+                    print(f"  🔄 Retrying {series_title} - {season_label}...")
+                    
+                    # More aggressive retry: 5 attempts, longer timeouts
+                    max_retries = 5
+                    episodes = []
+                    
+                    for attempt in range(max_retries):
+                        try:
+                            retry_driver.get(season_url)
+                            self.wait_for_css_element(retry_driver, "body", timeout=15)
+                            # Silent retries except final attempt
+                            silent = attempt < max_retries - 1
+                            if self.wait_for_css_element(retry_driver, "table.episodes", timeout=30 + attempt * 10, silent=silent):
+                                season_html = retry_driver.page_source
+                                episodes = self.scrape_episodes_from_html(season_html)
+                                break
+                            else:
+                                if attempt < max_retries - 1:
+                                    print(f"    ⚠ Retry {attempt + 2}/{max_retries} for {season_label}")
+                                    time.sleep(3)  # Longer pause between retries
+                        except Exception as inner_e:
+                            if attempt < max_retries - 1:
+                                print(f"    ⚠ Error retry {attempt + 2}/{max_retries}: {inner_e}")
+                                time.sleep(3)
+                            else:
+                                print(f"    ✗ Final failure for {season_label}: {inner_e}")
+                    
+                    if episodes:
+                        # Find the series in series_data and update the season
+                        for series_entry in self.series_data:
+                            if series_entry.get('url') == series_url:
+                                # Find and update the season
+                                for season in series_entry.get('seasons', []):
+                                    if season.get('season') == season_label:
+                                        season['episodes'] = episodes
+                                        season['watched_episodes'] = sum(1 for ep in episodes if ep['watched'])
+                                        season['total_episodes'] = len(episodes)
+                                        # Recalculate series totals
+                                        series_entry['watched_episodes'] = sum(s.get('watched_episodes', 0) for s in series_entry['seasons'])
+                                        series_entry['total_episodes'] = sum(s.get('total_episodes', 0) for s in series_entry['seasons'])
+                                        print(f"    ✓ Successfully recovered {len(episodes)} episodes for {season_label}")
+                                        successful_retries += 1
+                                        break
+                                break
+                        
+                        # Remove from failed list
+                        self.failed_seasons.remove(failed_season)
+                    else:
+                        print(f"    ✗ Could not recover {season_label} after {max_retries} attempts")
+                        
+                except Exception as e:
+                    print(f"    ✗ Unexpected error retrying {season_label}: {e}")
+                    continue
+            
+            if successful_retries > 0:
+                print(f"\n✓ Recovered {successful_retries} seasons from {len(self.failed_seasons) + successful_retries} failed attempts")
+            
+            if self.failed_seasons:
+                print(f"⚠ {len(self.failed_seasons)} seasons still failed. Consider manual checking or running again later.")
+                # Save remaining failed seasons for future retry
+                self._save_failed_seasons_to_file()
+        
+        finally:
+            try:
+                retry_driver.quit()
+            except Exception:
+                pass
+    
+    def _save_failed_seasons_to_file(self):
+        """Save remaining failed seasons to file for future retry"""
+        try:
+            failed_seasons_file = os.path.join(DATA_DIR, '.failed_seasons.json')
+            with open(failed_seasons_file, 'w', encoding='utf-8') as f:
+                json.dump(self.failed_seasons, f, ensure_ascii=False, indent=2)
+            print(f"  → Failed seasons saved to {failed_seasons_file}")
+        except Exception as e:
+            print(f"  ⚠ Could not save failed seasons: {e}")
     
     def _scrape_series_worker(self, series):
         """Worker for parallel processing"""
