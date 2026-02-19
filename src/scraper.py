@@ -24,7 +24,7 @@ from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIE
 
 # Performance settings
 # Allow overriding worker count via environment variable BS_MAX_WORKERS
-MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "12"))
+MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))  # Default to 16 workers for parallel scraping
 USE_PARALLEL = True
 
 
