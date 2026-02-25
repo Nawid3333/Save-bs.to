@@ -5,10 +5,6 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Website configuration
-WEBSITE_URL = "https://bs.to"
-LOGIN_PAGE = f"{WEBSITE_URL}/login"
-
 # Credentials (store in .env file)
 USERNAME = os.getenv("BS_USERNAME", "")
 PASSWORD = os.getenv("BS_PASSWORD", "")
@@ -16,7 +12,6 @@ PASSWORD = os.getenv("BS_PASSWORD", "")
 # Data storage
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 SERIES_INDEX_FILE = os.path.join(DATA_DIR, "series_index.json")
-SELECTORS_FILE = os.path.join(DATA_DIR, "selectors.json")
 
 # Load selectors configuration
 CONFIG_DIR = os.path.dirname(__file__)

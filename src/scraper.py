@@ -3,21 +3,26 @@ BS.TO Series Scraper v2 - Config-based, clean implementation
 Automatically scrapes watched TV series from bs.to with configurable selectors
 """
 
-import time
-import random
+import atexit
 import json
 import os
+import random
+import re
+import subprocess
+import sys
+import tempfile
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from urllib.parse import urljoin, urlparse
+
+from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service as FirefoxService
-import sys
-from bs4 import BeautifulSoup
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import atexit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
@@ -36,7 +41,6 @@ def is_regular_season(season_label):
     Returns True for regular seasons that can use the 'assume unwatched' optimization.
     Returns False for special seasons that should always be checked individually.
     """
-    import re
     # Match patterns like 'Staffel 1', 'Season 2', 'S1', just '1', '2', etc.
     return bool(re.search(r'^(staffel|season|s)?\s*\d+$', season_label.strip(), re.IGNORECASE))
 
@@ -53,9 +57,15 @@ def cleanup_geckodriver_processes():
                     for worker_id, pid in pids.items():
                         try:
                             if sys.platform == 'win32':
-                                os.system(f'taskkill /F /PID {pid} /T 2>nul')
+                                subprocess.run(
+                                    ['taskkill', '/F', '/PID', str(pid), '/T'],
+                                    capture_output=True, check=False
+                                )
                             else:
-                                os.system(f'kill -9 {pid} 2>/dev/null')
+                                subprocess.run(
+                                    ['kill', '-9', str(pid)],
+                                    capture_output=True, check=False
+                                )
                         except Exception:
                             pass
             except Exception:
@@ -78,7 +88,6 @@ class BsToScraper:
         #   https://bs.to/serie/Series-Name/1/1/de
         #   /serie/Series-Name/1/de
         #   /serie/Series-Name/1/1/de
-        import re
         # Remove protocol and domain if present
         url = re.sub(r"^https?://[^/]+", "", url)
         # Find the /serie/Series-Name part
@@ -104,45 +113,33 @@ class BsToScraper:
         self.completed_links = set()
         self.failed_links = []
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
+        self._worker_lock = threading.Lock()  # Protects worker_pids dict/file writes
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
     
-    # ==================== MERGE HELPERS ====================
+    # ==================== FILE I/O HELPERS ====================
     
-    def merge_series_entry(self, old_entry, new_entry):
-        """Merge new series data into existing entry.
+    @staticmethod
+    def _atomic_write_json(filepath, data):
+        """Write JSON to file atomically via temp file + os.replace.
         
-        Note: This merge does NOT preserve watched status - it uses the raw data
-        from the website. Protection against unwatching is handled later in
-        confirm_and_save_changes() where the user can choose to allow it.
+        Prevents corrupted files if the process is killed mid-write.
+        os.replace is atomic on both Windows and POSIX.
         """
-        old_entry['status'] = 'active'  # Mark as active again if was unavailable
-        old_seasons = {s.get('season'): s for s in old_entry.get('seasons', [])}
-        
-        for new_season in new_entry.get('seasons', []):
-            season_label = new_season.get('season')
-            if season_label in old_seasons:
-                # Keep existing episodes, add new ones from new_season
-                old_eps = {ep.get('number'): ep for ep in old_seasons[season_label].get('episodes', [])}
-                for new_ep in new_season.get('episodes', []):
-                    ep_num = new_ep.get('number')
-                    # Use the new watched status from website (no protection here)
-                    old_eps[ep_num] = new_ep
-                old_seasons[season_label]['episodes'] = list(old_eps.values())
-            else:
-                old_seasons[season_label] = new_season
-        
-        old_entry['seasons'] = list(old_seasons.values())
-        # Recalculate watched count from merged episodes
-        old_entry['watched_episodes'] = sum(
-            sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
-            for s in old_entry['seasons']
-        )
-        old_entry['total_episodes'] = sum(s.get('total_episodes', 0) for s in old_entry['seasons'])
-        old_entry['url'] = new_entry.get('url', old_entry.get('url'))
-        
-        return old_entry
+        dirpath = os.path.dirname(filepath)
+        os.makedirs(dirpath, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix='.tmp')
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, filepath)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
     
     # ==================== CONFIG HELPERS ====================
     
@@ -174,7 +171,7 @@ class BsToScraper:
             page_html = driver.page_source.lower()
             login_config = self.get_selector('login')
             markers = login_config.get('verification_markers', ['logout', 'hallo']) if login_config else ['logout']
-            markers_to_check = markers + [USERNAME.lower()]
+            markers_to_check = [m.lower() for m in markers] + [USERNAME.lower()]
             return any(token in page_html for token in markers_to_check)
         except Exception:
             return False
@@ -228,7 +225,7 @@ class BsToScraper:
                     EC.presence_of_element_located((by, selector_value))
                 )
                 return element
-            except:
+            except Exception:
                 continue
         
         return None
@@ -263,18 +260,18 @@ class BsToScraper:
     # ==================== CHECKPOINT SYSTEM ====================
     
     def save_checkpoint(self):
-        """Save scraping checkpoint to resume later (as dict with 'completed_links')"""
+        """Save scraping checkpoint to resume later (as dict with 'completed_links')
+        
+        Uses atomic write to prevent corruption if process is killed mid-write.
+        """
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
             checkpoint_data = {'completed_links': list(self.completed_links)}
-            with open(self.checkpoint_file, 'w', encoding='utf-8') as f:
-                json.dump(checkpoint_data, f, ensure_ascii=False)
+            self._atomic_write_json(self.checkpoint_file, checkpoint_data)
         except Exception:
             pass
     
     def load_checkpoint(self):
         """Load checkpoint to resume from previous run (expects dict with 'completed_links')"""
-        import json
         if not os.path.exists(self.checkpoint_file):
             return False
         try:
@@ -303,13 +300,14 @@ class BsToScraper:
             pass
     
     def save_failed_series(self):
-        """Save failed series links for later retry"""
+        """Save failed series links for later retry.
+        
+        Uses atomic write to prevent corruption if process is killed mid-write.
+        """
         if not self.failed_links:
             return
         try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            with open(self.failed_file, 'w', encoding='utf-8') as f:
-                json.dump(self.failed_links, f, ensure_ascii=False)
+            self._atomic_write_json(self.failed_file, list(self.failed_links))
         except Exception:
             pass
     
@@ -345,32 +343,33 @@ class BsToScraper:
             pass
     
     def save_worker_pid(self, worker_id, pid):
-        """Track a worker's geckodriver PID"""
-        self.worker_pids[str(worker_id)] = pid
-        try:
-            os.makedirs(DATA_DIR, exist_ok=True)
-            with open(self.worker_pids_file, 'w', encoding='utf-8') as f:
-                json.dump(self.worker_pids, f)
-        except Exception:
-            pass
+        """Track a worker's geckodriver PID (thread-safe, atomic write)"""
+        with self._worker_lock:
+            self.worker_pids[str(worker_id)] = pid
+            try:
+                self._atomic_write_json(self.worker_pids_file, dict(self.worker_pids))
+            except Exception:
+                pass
     
     def clear_worker_pids(self):
-        """Clear tracked worker PIDs after scraping"""
-        self.worker_pids = {}
-        try:
-            if os.path.exists(self.worker_pids_file):
-                os.remove(self.worker_pids_file)
-        except Exception:
-            pass
+        """Clear tracked worker PIDs after scraping (thread-safe)"""
+        with self._worker_lock:
+            self.worker_pids = {}
+            try:
+                if os.path.exists(self.worker_pids_file):
+                    os.remove(self.worker_pids_file)
+            except Exception:
+                pass
     
     # ==================== DRIVER SETUP ====================
     
-    def setup_driver(self):
-        """Initialize the Selenium WebDriver"""
+    def _build_firefox_options(self):
+        """Build shared Firefox options for both main and worker drivers"""
         firefox_options = Options()
         if HEADLESS:
             firefox_options.add_argument("--headless")
         firefox_options.add_argument("--disable-gpu")
+        firefox_options.add_argument('--disable-blink-features=AutomationControlled')
         # Performance/stealth preferences
         firefox_options.set_preference("permissions.default.image", 1)
         firefox_options.set_preference("media.autoplay.default", 1)
@@ -380,8 +379,19 @@ class BsToScraper:
             "general.useragent.override",
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
         )
-        
-        firefox_service = FirefoxService()
+        return firefox_options
+    
+    def _build_firefox_service(self):
+        """Build Firefox service, using local geckodriver if available"""
+        gecko_path = os.path.join(os.path.dirname(__file__), '..', 'geckodriver.exe')
+        if os.path.exists(gecko_path):
+            return FirefoxService(gecko_path)
+        return FirefoxService()
+    
+    def setup_driver(self):
+        """Initialize the Selenium WebDriver"""
+        firefox_options = self._build_firefox_options()
+        firefox_service = self._build_firefox_service()
         self.driver = webdriver.Firefox(service=firefox_service, options=firefox_options)
         
         # Track main driver PID for sequential mode (option 9)
@@ -402,23 +412,29 @@ class BsToScraper:
     
     # ==================== AUTHENTICATION ====================
     
-    def login(self):
-        """Login to bs.to using config-based selectors"""
+    def login(self, driver=None):
+        """Login to bs.to using config-based selectors.
+        
+        Args:
+            driver: WebDriver instance to use. Defaults to self.driver.
+        """
+        drv = driver or self.driver
         try:
             login_config = self.get_selector('login')
             if not login_config:
                 raise Exception("Login config not found in selectors_config.json")
             
             login_page = self.get_login_page()
-            print(f"→ Navigating to login page: {login_page}")
-            self.driver.get(login_page)
+            if drv is self.driver:
+                print(f"→ Navigating to login page: {login_page}")
+            drv.get(login_page)
             
             # Wait for login form to appear
-            self.wait_for_css_element(self.driver, "input[type='submit'], button[type='submit']", timeout=3)
+            self.wait_for_css_element(drv, "input[type='submit'], button[type='submit']", timeout=3)
 
             # Username field
             username_field = self.find_element_from_config(
-                self.driver, 
+                drv, 
                 login_config.get('username_field', []),
                 timeout=3
             )
@@ -428,7 +444,7 @@ class BsToScraper:
 
             # Password field
             password_field = self.find_element_from_config(
-                self.driver,
+                drv,
                 login_config.get('password_field', []),
                 timeout=3
             )
@@ -438,12 +454,13 @@ class BsToScraper:
 
             # Submit button
             submit_button = self.find_element_from_config(
-                self.driver,
+                drv,
                 login_config.get('submit_button', []),
                 timeout=2
             )
 
-            print("→ Submitting login...")
+            if drv is self.driver:
+                print("→ Submitting login...")
             if submit_button:
                 submit_button.click()
             else:
@@ -451,31 +468,33 @@ class BsToScraper:
 
             # Wait for redirect or page load
             try:
-                WebDriverWait(self.driver, TIMEOUT).until(
+                WebDriverWait(drv, TIMEOUT).until(
                     lambda d: d.current_url != login_page
                 )
             except Exception:
                 pass
 
             # Wait for body to fully load
-            self.wait_for_css_element(self.driver, "body", timeout=3)
+            self.wait_for_css_element(drv, "body", timeout=3)
             
             # Additional delay after login for page stabilization
             time.sleep(self.get_timing('login_delay'))
             
             # Verify login with markers from config
-            if self.is_logged_in(self.driver):
-                print("✓ Login completed")
-                try:
-                    self.auth_cookies = self.driver.get_cookies()
-                except Exception:
-                    self.auth_cookies = []
+            if self.is_logged_in(drv):
+                if drv is self.driver:
+                    print("✓ Login completed")
+                    try:
+                        self.auth_cookies = drv.get_cookies()
+                    except Exception:
+                        self.auth_cookies = []
                 return
 
-            raise Exception(f"Login verification failed. URL: {self.driver.current_url}")
+            raise Exception(f"Login verification failed. URL: {drv.current_url}")
 
         except Exception as e:
-            print(f"✗ Login failed: {str(e)}")
+            if drv is self.driver:
+                print(f"✗ Login failed: {str(e)}")
             raise
     
     # ==================== SERIES DISCOVERY ====================
@@ -606,7 +625,6 @@ class BsToScraper:
                 season_type_val = label
 
             # Build correct season URL using urljoin (handles all cases)
-            from urllib.parse import urljoin
             if href.startswith('http'):
                 season_url = href
             elif href:
@@ -704,19 +722,36 @@ class BsToScraper:
                 return error_text
         return None
     
-    def process_series_page(self, url, series_hint=None, existing_entry=None, parallel_mode=False):
-        """Navigate to series page, extract title and all seasons/episodes"""
+    def process_series_page(self, url, series_hint=None):
+        """Navigate to series page using the main driver. Thin wrapper around _process_series."""
+        return self._process_series(self.driver, url, series_hint=series_hint)
+    
+    def _process_series(self, driver, url, series_hint=None):
+        """Core method: navigate to a series page, extract title and all seasons/episodes.
+        
+        Used by both sequential (self.driver) and parallel (worker driver) modes.
+        All scraping logic lives here — no duplicates.
+        """
         try:
-            self.driver.get(url)
+            driver.get(url)
             # Wait for the body to be present and visible (ensures page is loaded)
-            self.wait_for_css_element(self.driver, "body", timeout=10)
+            self.wait_for_css_element(driver, "body", timeout=10)
             # Wait for title to appear (series title) - silent since not all pages have h2
-            self.wait_for_css_element(self.driver, "h2", timeout=10, silent=True)
+            self.wait_for_css_element(driver, "h2", timeout=10, silent=True)
 
-            page_content = self.driver.page_source
+            page_content = driver.page_source
 
-            # Check for German error message "Serie nicht gefunden!" (Series not found)
-            # This indicates an invalid or removed series
+            # Detect browser navigation / network error pages (about:neterror etc.)
+            try:
+                current_url = driver.current_url or ''
+            except Exception:
+                current_url = ''
+            if current_url.startswith('about:neterror') or 'neterror' in current_url or 'dnsNotFound' in current_url:
+                raise Exception(f"Reached error page: {current_url}")
+            if page_content and ('Die Verbindung mit dem Server' in page_content or 'dnsNotFound' in page_content):
+                raise Exception(f"Reached error page content for: {url}")
+
+            # Check for German error message "Serie nicht gefunden" (Series not found)
             error_found = self.check_series_not_found_error(page_content)
             if error_found:
                 print(f"✗ Series not found: {url} - {error_found}")
@@ -758,31 +793,28 @@ class BsToScraper:
             total_eps = 0
 
             for idx, season_item in enumerate(season_links):
-                # Parse season item into components
                 season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
-                    # Always load and scrape the season page, no cache or optimization
-                    max_retries = self.get_timing('max_retries_season') or 3
+                    max_retries = int(self.get_timing('max_retries_season') or 3)
                     episodes = []
                     season_failed = True
                     
                     for attempt in range(max_retries):
                         try:
-                            self.driver.get(season_url)
+                            driver.get(season_url)
                             time.sleep(self.get_timing('season_load_delay'))
-                            self.wait_for_css_element(self.driver, "body", timeout=10)
-                            # Make retries silent except for the final attempt
+                            self.wait_for_css_element(driver, "body", timeout=10)
                             silent = attempt < max_retries - 1
-                            if self.wait_for_css_element(self.driver, "table.episodes", timeout=20 + attempt * 5, silent=silent):
-                                season_html = self.driver.page_source
+                            if self.wait_for_css_element(driver, "table.episodes", timeout=20 + attempt * 5, silent=silent):
+                                season_html = driver.page_source
                                 episodes = self.scrape_episodes_from_html(season_html)
                                 season_failed = False
                                 break
                             else:
                                 if attempt < max_retries - 1:
                                     print(f"⚠ Retrying season {season_label} (attempt {attempt + 2}/{max_retries})")
-                                    time.sleep(2)  # Brief pause before retry
+                                    time.sleep(2)
                         except Exception as inner_e:
                             if attempt < max_retries - 1:
                                 print(f"⚠ Error loading season {season_label}, retrying (attempt {attempt + 2}/{max_retries}): {inner_e}")
@@ -790,28 +822,28 @@ class BsToScraper:
                             else:
                                 print(f"✗ Failed to load season {season_label} after {max_retries} attempts: {inner_e}")
                     
-                    watched_count = sum(1 for ep in episodes if ep['watched'])
-                    total_count = len(episodes)
+                    if not season_failed:
+                        watched_count = sum(1 for ep in episodes if ep['watched'])
+                        total_count = len(episodes)
 
-                    seasons_data.append({
-                        "season": season_label,
-                        "url": season_url,
-                        "episodes": episodes,
-                        "watched_episodes": watched_count,
-                        "total_episodes": total_count
-                    })
+                        seasons_data.append({
+                            "season": season_label,
+                            "url": season_url,
+                            "episodes": episodes,
+                            "watched_episodes": watched_count,
+                            "total_episodes": total_count
+                        })
 
-                    total_watched += watched_count
-                    total_eps += total_count
+                        total_watched += watched_count
+                        total_eps += total_count
                 except Exception as e:
                     continue
+
             # Robust link assignment
             link = None
             if series_hint and series_hint.get('link'):
                 link = series_hint.get('link')
             else:
-                from urllib.parse import urlparse
-                import re
                 parsed = urlparse(url)
                 m = re.match(r'(/serie/[^/]+)', parsed.path)
                 if m:
@@ -873,7 +905,7 @@ class BsToScraper:
             
             all_series = self.get_all_series()
 
-            if USE_PARALLEL:
+            if self._use_parallel:
                 print("→ Starting series scraping (parallel mode)...")
                 # Full scrape uses the configured pool (default MAX_WORKERS)
                 self._scrape_series_parallel(all_series)
@@ -925,6 +957,7 @@ class BsToScraper:
                         print("  ⚠ Skipped (no data)")
                 except Exception as e:
                     print(f"  ⚠ Error processing {series['title']}: {str(e)}")
+                    self.failed_links.append(series)
                     continue
         except KeyboardInterrupt:
             print("\n\n⚠ Scraping interrupted by user (Ctrl+C)")
@@ -932,6 +965,11 @@ class BsToScraper:
             print("→ Use 'Resume from checkpoint' option to continue later\n")
             return
         
+        # Save failed series for later retry (sequential mode)
+        if self.failed_links:
+            self.save_failed_series()
+            print(f"\n⚠ {len(self.failed_links)} series failed. Saved to .failed_series.json for retry.")
+
         # Final summary
         total_time = time.time() - start_time
         total_mins = int(total_time / 60)
@@ -948,7 +986,6 @@ class BsToScraper:
         completed = 0
         failed = 0
         lock = threading.Lock()
-        auth_lock = threading.Lock()  # Serialize worker authentication
         stop_event = threading.Event()
 
         # Filter utility pages (case-insensitive)
@@ -1005,32 +1042,42 @@ class BsToScraper:
             error_streak = 0
             tasks_since_check = 0
             
-            # Authentication must be sequential across all workers to avoid rate limiting
-            with auth_lock:
-                # Each worker does its own full login (no cookie sharing - more reliable)
-                authenticated = False
-                max_auth_retries = 3
-                for attempt in range(max_auth_retries):
-                    try:
-                        self._login_with_driver(driver)
-                        
-                        # Verify login worked
+            # Share cookies from main driver login (already authenticated in run())
+            authenticated = False
+            max_auth_retries = 3
+            for attempt in range(max_auth_retries):
+                try:
+                    if self._apply_cookies_to_driver(driver) and self.is_logged_in(driver):
+                        authenticated = True
+                        break
+                    else:
+                        # Cookie sharing failed, fall back to full login
+                        self.login(driver)
                         driver.get(self.get_site_url())
                         time.sleep(1.0)
-                        
                         if self.is_logged_in(driver):
                             authenticated = True
                             break
                         else:
                             print(f"  ⚠ Worker #{worker_id}: Login verification failed (try {attempt + 1}/{max_auth_retries})")
                             time.sleep(1)
-                    except Exception as e:
-                        print(f"  ⚠ Worker #{worker_id}: Login failed - {str(e)[:80]}")
-                        time.sleep(1)
-                        continue
+                except Exception as e:
+                    print(f"  ⚠ Worker #{worker_id}: Auth failed - {str(e)[:80]}")
+                    time.sleep(1)
+                    continue
             
             if not authenticated:
                 print(f"  ✗ Worker #{worker_id}: Failed to authenticate after {max_auth_retries} attempts. Aborting to prevent incorrect data.")
+                # Close the driver before bailing out
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                # Add all this worker's series to failed_links so they can be retried
+                with lock:
+                    for s in my_series_list:
+                        self.failed_links.append(s)
+                    failed += len(my_series_list)
                 return  # Exit worker without processing
 
             # Process dedicated series list (no queue competition)
@@ -1045,7 +1092,7 @@ class BsToScraper:
 
                 try:
                     # Scrape the series
-                    result = self._process_series_with_driver(driver, series['url'], series, existing_entry=None)
+                    result = self._process_series(driver, series['url'], series)
                     with lock:
                         if result:
                             empty = result.get('total_episodes', 0) == 0
@@ -1069,7 +1116,7 @@ class BsToScraper:
                     with lock:
                         failed += 1
                         self.failed_links.append(series)
-                    progress_line(completed, total_series, series.get('title', 'Series'), error=str(e)[:120], worker_id=worker_id)
+                        progress_line(completed, total_series, series.get('title', 'Series'), error=str(e)[:120], worker_id=worker_id)
                     error_streak += 1
 
                 if error_streak == 0 and success_delay and success_delay > 0:
@@ -1096,7 +1143,9 @@ class BsToScraper:
                             driver.get(self.get_site_url())
                             if not self.is_logged_in(driver):
                                 try:
-                                    self._login_with_driver(driver)
+                                    # Try cookies first, fall back to full login
+                                    if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
+                                        self.login(driver)
                                     error_streak = 0
                                 except Exception:
                                     error_streak += 1
@@ -1112,7 +1161,7 @@ class BsToScraper:
                     cookies_ok = self._apply_cookies_to_driver(driver)
                     if not cookies_ok:
                         try:
-                            self._login_with_driver(driver)
+                            self.login(driver)
                         except Exception:
                             pass
                     error_streak = 0
@@ -1129,8 +1178,6 @@ class BsToScraper:
                 worker_pool = worker_pools[worker_id - 1]
                 print(f"  🔺 Worker #{worker_id} starting ({len(worker_pool)} series)")
                 futures.append(executor.submit(worker_loop, worker_id, worker_pool))
-                # Stagger worker startup to avoid simultaneous auth attempts
-                time.sleep(1.0)
 
             # Wait for all workers to complete (not just queue to empty)
             for f in as_completed(futures):
@@ -1150,6 +1197,9 @@ class BsToScraper:
                     f.result()
                 except Exception:
                     pass
+
+        # Save final checkpoint to capture any progress since last periodic save
+        self.save_checkpoint()
 
         # Check if pause was requested
         if self.is_pause_requested():
@@ -1184,9 +1234,7 @@ class BsToScraper:
             except (EOFError, KeyboardInterrupt):
                 print("\nSkipping series retries due to input interruption.")
                 self.save_failed_series()
-    
 
-    
     def _retry_failed_series(self):
         """Retry scraping failed series with more aggressive settings"""
         if not self.failed_links:
@@ -1195,15 +1243,16 @@ class BsToScraper:
         print(f"  → Using more aggressive retry settings for series")
         
         successful_retries = 0
-        for failed_series in self.failed_links[:]:  # Copy to avoid modification during iteration
+        still_failed = []
+        for failed_series in self.failed_links:
             try:
                 series_title = failed_series.get('title', 'Unknown')
                 series_url = failed_series.get('url', failed_series.get('link', ''))
                 
                 print(f"  🔄 Retrying series: {series_title}...")
                 
-                # Try to scrape the series again
-                result = self._process_series_with_driver(None, series_url, failed_series)
+                # Try to scrape the series again using the main driver
+                result = self._process_series(self.driver, series_url, failed_series)
                 
                 if result and result.get('seasons'):
                     # Success! Add to series_data
@@ -1211,71 +1260,28 @@ class BsToScraper:
                     self.completed_links.add(failed_series.get('link'))
                     successful_retries += 1
                     print(f"    ✓ Successfully recovered {len(result.get('seasons', []))} seasons for {series_title}")
-                    
-                    # Remove from failed list
-                    self.failed_links.remove(failed_series)
                 else:
+                    still_failed.append(failed_series)
                     print(f"    ✗ Could not recover {series_title}")
                         
             except Exception as e:
+                still_failed.append(failed_series)
                 print(f"    ✗ Unexpected error retrying {series_title}: {e}")
                 continue
+        
+        self.failed_links = still_failed
         
         if successful_retries > 0:
             print(f"\n✓ Recovered {successful_retries} series from {len(self.failed_links) + successful_retries} failed attempts")
         
         if self.failed_links:
             print(f"⚠ {len(self.failed_links)} series still failed. Consider manual checking or running again later.")
-            # Save remaining failed series
             self.save_failed_series()
-    
-    def _scrape_series_worker(self, series):
-        """Worker for parallel processing"""
-        try:
-            worker_driver = self._create_worker_driver()
-            
-            # Try cookie-based auth
-            cookies_ok = self._apply_cookies_to_driver(worker_driver)
-            if cookies_ok:
-                worker_driver.get(self.get_site_url())
-                if not self.is_logged_in(worker_driver):
-                    cookies_ok = False
-            
-            if not cookies_ok:
-                self._login_with_driver(worker_driver)
-            
-            # Scrape the series
-            result = self._process_series_with_driver(worker_driver, series['url'], series)
-            worker_driver.quit()
-            
-            return result
-        except Exception as e:
-            try:
-                worker_driver.quit()
-            except:
-                pass
-            raise e
     
     def _create_worker_driver(self, worker_id=None):
         """Create a new WebDriver for worker thread and track its PID"""
-        firefox_options = Options()
-        if HEADLESS:
-            firefox_options.add_argument('--headless')
-        firefox_options.add_argument('--disable-blink-features=AutomationControlled')
-        firefox_options.set_preference("permissions.default.image", 1)
-        firefox_options.set_preference("media.autoplay.default", 1)
-        firefox_options.set_preference("dom.ipc.processPrelaunch.enabled", False)
-        firefox_options.set_preference("network.http.speculative-parallel-limit", 0)
-        firefox_options.set_preference(
-            "general.useragent.override",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
-        )
-        
-        gecko_path = os.path.join(os.path.dirname(__file__), '..', 'geckodriver.exe')
-        if os.path.exists(gecko_path):
-            service = FirefoxService(gecko_path)
-        else:
-            service = FirefoxService()
+        firefox_options = self._build_firefox_options()
+        service = self._build_firefox_service()
         
         driver = webdriver.Firefox(service=service, options=firefox_options)
         
@@ -1300,13 +1306,14 @@ class BsToScraper:
         return driver
     
     def _apply_cookies_to_driver(self, driver):
-        """Apply auth cookies to worker driver"""
-        if not self.auth_cookies:
+        """Apply auth cookies to worker driver (thread-safe snapshot)"""
+        cookies_snapshot = list(self.auth_cookies)  # Snapshot to avoid race conditions
+        if not cookies_snapshot:
             return False
         try:
             driver.get(self.get_site_url())
             time.sleep(self.get_timing('action_delay'))
-            for cookie in self.auth_cookies:
+            for cookie in cookies_snapshot:
                 try:
                     driver.add_cookie({
                         'name': cookie.get('name'),
@@ -1322,156 +1329,6 @@ class BsToScraper:
             return True
         except Exception:
             return False
-    
-    def _login_with_driver(self, driver):
-        """Login using worker driver"""
-        try:
-            login_page = self.get_login_page()
-            driver.get(login_page)
-            # Wait for login form
-            self.wait_for_css_element(driver, "input[type='submit'], button[type='submit']", timeout=3)
-
-            login_config = self.get_selector('login')
-            if not login_config:
-                raise Exception("Login config not found")
-            
-            username_field = self.find_element_from_config(
-                driver,
-                login_config.get('username_field', []),
-                timeout=3
-            )
-            if not username_field:
-                raise Exception("Username field not found")
-            username_field.send_keys(USERNAME)
-
-            password_field = self.find_element_from_config(
-                driver,
-                login_config.get('password_field', []),
-                timeout=3
-            )
-            if not password_field:
-                raise Exception("Password field not found")
-            password_field.send_keys(PASSWORD)
-
-            submit_button = self.find_element_from_config(
-                driver,
-                login_config.get('submit_button', []),
-                timeout=2
-            )
-
-            if submit_button:
-                submit_button.click()
-            else:
-                password_field.send_keys("\n")
-
-            # Wait for body to load
-            self.wait_for_css_element(driver, "body", timeout=3)
-            
-            if not self.is_logged_in(driver):
-                raise Exception("Worker login verification failed")
-        except Exception as e:
-            raise Exception(f"Worker login failed: {str(e)}")
-    
-    def _process_series_with_driver(self, driver, url, series_hint=None, existing_entry=None):
-        """Process series using specific driver (used by parallel workers)"""
-        try:
-            driver.get(url)
-            # Wait for title to appear - silent since not all pages have h2
-            self.wait_for_css_element(driver, "h2", timeout=10, silent=True)
-            page_content = driver.page_source
-            
-            title_info = self.extract_series_title(page_content)
-            title_value = title_info if title_info else None
-            
-            # Skip utility/navigation pages that somehow got through filtering
-            if title_value:
-                title_normalized = title_value.lower().strip()
-                utility_pages = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
-                if title_normalized in utility_pages or any(keyword in title_normalized for keyword in utility_pages):
-                    print(f"⚠ Skipping utility page: '{title_value}' (URL: {url})")
-                    return {
-                        'title': title_value,
-                        'url': url,
-                        'total_episodes': 0,
-                        'watched_episodes': 0,
-                        'seasons': []
-                    }
-            
-            season_links = self.get_season_links(page_content, url)
-            if not season_links:
-                season_links = [("1", url, "none")]
-            
-            seasons_data = []
-            total_watched = 0
-            total_eps = 0
-
-            for idx, season_item in enumerate(season_links):
-                # Parse season item into components
-                season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
-
-                try:
-                    # Always load and scrape the season page, no cache or optimization
-                    max_retries = self.get_timing('max_retries_season') or 3
-                    episodes = []
-                    season_failed = True
-                    
-                    for attempt in range(max_retries):
-                        try:
-                            driver.get(season_url)
-                            time.sleep(self.get_timing('season_load_delay'))
-                            self.wait_for_css_element(driver, "body", timeout=10)
-                            # Make retries silent except for the final attempt
-                            silent = attempt < max_retries - 1
-                            if self.wait_for_css_element(driver, "table.episodes", timeout=20 + attempt * 5, silent=silent):
-                                season_html = driver.page_source
-                                episodes = self.scrape_episodes_from_html(season_html)
-                                season_failed = False
-                                break
-                            else:
-                                if attempt < max_retries - 1:
-                                    time.sleep(2)  # Brief pause before retry
-                        except Exception as inner_e:
-                            if attempt < max_retries - 1:
-                                time.sleep(2)
-                            else:
-                                # Final failure - continue to next season
-                                break
-                    
-                    if not season_failed and episodes:
-                        watched_count = sum(1 for ep in episodes if ep['watched'])
-                        total_count = len(episodes)
-
-                        seasons_data.append({
-                            "season": season_label,
-                            "url": season_url,
-                            "episodes": episodes,
-                            "watched_episodes": watched_count,
-                            "total_episodes": total_count
-                        })
-
-                        total_watched += watched_count
-                        total_eps += total_count
-                except Exception as e:
-                    continue
-            
-            from urllib.parse import urlparse
-            link = series_hint.get('link') if series_hint else None
-            if not link:
-                parsed = urlparse(url)
-                link = parsed.path or url
-            if not link.startswith('/'):
-                link = '/' + link
-            
-            return {
-                "title": title_value or (series_hint.get('title') if series_hint else url),
-                "link": link,
-                "url": url,
-                "seasons": seasons_data,
-                "watched_episodes": total_watched,
-                "total_episodes": total_eps
-            }
-        except Exception as e:
-            raise Exception(f"Series processing failed for {url}: {str(e)}")
     
     # ==================== DATA MANAGEMENT ====================
     
@@ -1547,7 +1404,7 @@ class BsToScraper:
             print("✓ All series already scraped")
             return
 
-        if USE_PARALLEL:
+        if self._use_parallel:
             # Resume can use full pool; series count will bound actual worker usage
             self._scrape_series_parallel(remaining_series)
         else:
@@ -1589,20 +1446,23 @@ class BsToScraper:
         series_list = []
         for url in urls:
             main_url = self.normalize_to_series_url(url)
-            series_list.append({'title': main_url.split('/')[-1], 'link': main_url, 'url': main_url})
+            # Extract path-only link (e.g. /serie/Breaking-Bad) for consistent dedup
+            m = re.match(r'https?://[^/]+(/serie/[^/]+)', main_url)
+            link_path = m.group(1) if m else main_url
+            series_list.append({'title': main_url.split('/')[-1], 'link': link_path, 'url': main_url})
         self.series_data = []
         self._scrape_series_sequential(series_list)
         print(f"  Successfully scraped: {len(self.series_data)}/{len(urls)} series")
     
     def run(self, output_file, single_url=None, url_list=None, new_only=False, resume_only=False, retry_failed=False, parallel=None):
         """Execute scraping workflow - collects data but does NOT save (caller handles save)"""
-        global USE_PARALLEL
-        original_use_parallel = USE_PARALLEL
-        
+        # Store parallel preference as instance attribute (thread-safe, no global mutation)
         if parallel is not None:
-            USE_PARALLEL = parallel
+            self._use_parallel = parallel
             mode_str = "parallel" if parallel else "sequential"
             print(f"→ Using {mode_str} mode")
+        else:
+            self._use_parallel = USE_PARALLEL
         
         try:
             self.setup_driver()
@@ -1626,8 +1486,11 @@ class BsToScraper:
                     self.scrape_series_list()
             
             self.clear_checkpoint()
-            self.clear_failed_series()
+            # Only clear failed series file if no failures remain
+            if not self.failed_links:
+                self.clear_failed_series()
+            else:
+                self.save_failed_series()
             self.clear_worker_pids()
         finally:
-            USE_PARALLEL = original_use_parallel
             self.close()

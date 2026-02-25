@@ -2,7 +2,6 @@
   "site_name": "bs.to",
   "site_url": "https://bs.to",
   "login_page": "https://bs.to/login",
-  "series_list_page": "/andere-serien",
 
   "selectors": {
     "login": {
@@ -17,6 +16,7 @@
     },
 
     "series_list": {
+      "page_url": "/andere-serien",
       "series_links": {
         "type": "css",
         "value": "a[href*='/serie/']",

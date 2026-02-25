@@ -6,7 +6,7 @@ A Python tool to automatically scrape your watched TV series from the bs.to webs
 
 ✨ **High-Performance Scraping**
 
-- **Parallel processing** with up to 24 concurrent workers
+- **Parallel processing** with up to 16 concurrent workers
 - Cookie-based authentication for worker threads
 - **~10-15 minutes** to scrape 10,000+ series
 - Automatic login to your bs.to account
@@ -122,7 +122,8 @@ Save bs.to/
 ├── .env.example           # Template for credentials
 ├── .env                   # Your credentials (git-ignored)
 ├── config/
-│   └── config.py          # Configuration settings
+│   ├── config.py          # Configuration settings
+│   └── selectors_config.json  # CSS selectors for scraping
 ├── src/
 │   ├── scraper.py         # Web scraper with Selenium
 │   └── index_manager.py   # Index and data management
@@ -136,7 +137,7 @@ Save bs.to/
 
 1. **Authentication**: Main driver logs into bs.to and captures session cookies
 2. **Series Discovery**: Scrapes all series links from `/andere-serien`
-3. **Parallel Processing**: Spawns worker threads (default: 24) with shared cookies
+3. **Parallel Processing**: Spawns worker threads (default: 16) with shared cookies
 4. **Episode Scraping**: Each worker:
    - Navigates to assigned series
    - Extracts all seasons (including Season 0 specials)
@@ -152,7 +153,7 @@ Save bs.to/
 Adjust workers in `src/scraper.py` line 20:
 
 ```python
-MAX_WORKERS = 24  # Increase for faster scraping (requires more RAM/CPU)
+MAX_WORKERS = 16  # Increase for faster scraping (requires more RAM/CPU)
 ```
 
 - **Low-end systems**: 4-6 workers

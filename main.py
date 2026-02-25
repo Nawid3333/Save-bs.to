@@ -25,9 +25,6 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
-# Add src directory to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
-
 from config.config import SERIES_INDEX_FILE, USERNAME, PASSWORD, DATA_DIR
 from src.scraper import BsToScraper
 from src.index_manager import IndexManager, confirm_and_save_changes
@@ -420,7 +417,6 @@ def retry_failed_series():
     
     # Pre-check for failed series before launching browser
     try:
-        from src.scraper import BsToScraper
         scraper = BsToScraper()
         failed_list = scraper.load_failed_series()
         if not failed_list:
