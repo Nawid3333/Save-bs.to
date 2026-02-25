@@ -137,6 +137,15 @@ def scrape_series():
             print("\n⚠ No data scraped")
             logger.warning("No data scraped during scraping operation")
         
+        # Offer to retry failed series with a fresh login (hooks into option 6)
+        if scraper.failed_links:
+            try:
+                response = input(f"\nRetry {len(scraper.failed_links)} failed series with a fresh login? (y/n): ").strip().lower()
+                if response in ['y', 'yes']:
+                    retry_failed_series()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSkipping retry.")
+        
     except RequestException as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in scrape_series: {e}")
@@ -166,6 +175,15 @@ def scrape_new_series():
         else:
             print("\n⚠ No new series found")
             logger.warning("No new series found during scraping operation")
+        
+        # Offer to retry failed series with a fresh login (hooks into option 6)
+        if scraper.failed_links:
+            try:
+                response = input(f"\nRetry {len(scraper.failed_links)} failed series with a fresh login? (y/n): ").strip().lower()
+                if response in ['y', 'yes']:
+                    retry_failed_series()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSkipping retry.")
     except RequestException as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in scrape_new_series: {e}")

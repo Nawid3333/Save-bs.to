@@ -1221,19 +1221,10 @@ class BsToScraper:
         else:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
         
-        # Offer retry for failed series only
+        # Save failed series for later retry (via menu option 6)
         if self.failed_links:
-            try:
-                response = input(f"Retry {len(self.failed_links)} failed series? (y/n): ").strip().lower()
-                if response in ['y', 'yes']:
-                    print(f"\n🔄 Retrying {len(self.failed_links)} failed series...")
-                    self._retry_failed_series()
-                else:
-                    print("Skipping series retries.")
-                    self.save_failed_series()
-            except (EOFError, KeyboardInterrupt):
-                print("\nSkipping series retries due to input interruption.")
-                self.save_failed_series()
+            self.save_failed_series()
+            print(f"\n⚠ {len(self.failed_links)} series failed. Use 'Retry failed series' (option 6) to rescrape with a fresh login.")
 
     def _retry_failed_series(self):
         """Retry scraping failed series with more aggressive settings"""
