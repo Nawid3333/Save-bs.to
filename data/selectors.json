@@ -1,0 +1,9 @@
+{
+  "title_selectors": [
+    {
+      "name": "h2_with_optional_small",
+      "description": "First h2 text; capture main title and optional <small> season label",
+      "approved": true
+    }
+  ]
+}

@@ -1402,18 +1402,18 @@ class BsToScraper:
             self._scrape_series_sequential(remaining_series)
     
     def scrape_retry_failed(self, output_file):
-        """Retry previously failed series"""
+        # Retry previously failed series (sequential mode for reliability)
         failed_list = self.load_failed_series()
         if not failed_list:
             print("✓ No failed series found")
             return
-        
-        print(f"✓ Found {len(failed_list)} failed series from last run")
-        self.series_data = []
-        
-        # Run sequential for reliability on retry
-        self._scrape_series_sequential(failed_list)
     
+        print(f"✓ Found {len(failed_list)} failed series from last run")
+        print("→ Starting retry in sequential mode (for reliability)...")
+        self.series_data = []
+    
+        # Always use sequential mode for reliability on retry
+        self._scrape_series_sequential(failed_list)
     # ==================== MAIN RUN METHODS ====================
     
     def scrape_single_series(self, url):

@@ -139,12 +139,9 @@ def scrape_series():
         
         # Offer to retry failed series with a fresh login (hooks into option 6)
         if scraper.failed_links:
-            try:
-                response = input(f"\nRetry {len(scraper.failed_links)} failed series with a fresh login? (y/n): ").strip().lower()
-                if response in ['y', 'yes']:
-                    retry_failed_series()
-            except (EOFError, KeyboardInterrupt):
-                print("\nSkipping retry.")
+            print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
+            # The failed series are already saved by the scraper
         
     except RequestException as e:
         print(f"\n✗ Network error occurred: {str(e)}")
@@ -178,12 +175,9 @@ def scrape_new_series():
         
         # Offer to retry failed series with a fresh login (hooks into option 6)
         if scraper.failed_links:
-            try:
-                response = input(f"\nRetry {len(scraper.failed_links)} failed series with a fresh login? (y/n): ").strip().lower()
-                if response in ['y', 'yes']:
-                    retry_failed_series()
-            except (EOFError, KeyboardInterrupt):
-                print("\nSkipping retry.")
+            print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
+            # The failed series are already saved by the scraper
     except RequestException as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in scrape_new_series: {e}")
@@ -427,7 +421,6 @@ def batch_add_series_from_file():
         print(f"\n✗ Batch add failed: {str(e)}")
         logger.error(f"Batch add failed: {e}")
 
-
 def retry_failed_series():
     """Retry previously failed series"""
     print("\n→ Retry failed series from last run")
@@ -442,7 +435,10 @@ def retry_failed_series():
             return
         print(f"✓ Found {len(failed_list)} failed series from last run")
         
-        scraper.run(SERIES_INDEX_FILE, retry_failed=True)
+        # Force sequential mode for reliability
+        print("\n→ Starting retry in sequential mode (for reliability)...")
+        scraper.run(SERIES_INDEX_FILE, retry_failed=True, parallel=False)
+        
         # Use scraped data directly from scraper and confirm before saving
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, "Retry data"):

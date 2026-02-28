@@ -43,16 +43,13 @@ Thumbs.db
 
 # Logs
 *.log
-# Data files (user-generated, don't track)
-data/*.json
-
 # User-specific series URLs
 series_urls.txt
 
 # Scraper pause/worker files
 /data/.pause_scraping
 /data/.worker_pids.json
-
+/data/.scrape_checkpoint.json
 # Personal data files
 /data/series_index.json
 /data/series_report.json
