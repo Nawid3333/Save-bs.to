@@ -38,8 +38,6 @@ wheels/
 .DS_Store
 Thumbs.db
 
-# Data files (optional - comment out to track)
-# data/*.json
 
 # Logs
 *.log
@@ -48,6 +46,7 @@ series_urls.txt
 
 # Scraper pause/worker files
 /data/.pause_scraping
+/data/.failed_series.json
 /data/.worker_pids.json
 /data/.scrape_checkpoint.json
 # Personal data files
