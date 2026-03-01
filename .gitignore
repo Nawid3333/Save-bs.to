@@ -52,3 +52,4 @@ series_urls.txt
 # Personal data files
 /data/series_index.json
 /data/series_report.json
+/watched.txt
