@@ -787,6 +787,9 @@ class BsToScraper:
             season_links = self.get_season_links(page_content, url)
             if not season_links:
                 season_links = [("1", url, "none")]  # Default: needs loading
+            else:
+                season_labels = [item[0] if isinstance(item, tuple) else item for item in season_links]
+                print(f"  Found {len(season_links)} season(s): {season_labels}")
 
             seasons_data = []
             total_watched = 0
