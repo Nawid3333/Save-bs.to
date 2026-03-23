@@ -1225,7 +1225,7 @@ class BsToScraper:
         # Save failed series for later retry
         if self.failed_links:
             self.save_failed_series()
-            print(f"\n⚠ {len(self.failed_links)} series failed. Saved to .failed_series.json for retry.")
+            print(f"\n⚠ {len(self.failed_links)} series failed. Use 'Retry failed series' (option 6) to rescrape with a fresh login.")
 
         total_time = time.time() - start_time
         total_mins = int(total_time / 60)
@@ -1234,11 +1234,6 @@ class BsToScraper:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s ({failed} failed)", flush=True)
         else:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
-        
-        # Save failed series for later retry (via menu option 6)
-        if self.failed_links:
-            self.save_failed_series()
-            print(f"\n⚠ {len(self.failed_links)} series failed. Use 'Retry failed series' (option 6) to rescrape with a fresh login.")
 
     def _retry_failed_series(self):
         """Retry scraping failed series with more aggressive settings"""

@@ -102,95 +102,86 @@ def show_menu():
     print("  9. Exit\n")
 
 
+def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
+    """Common pattern: create scraper, run, confirm & save, handle errors.
+    
+    Returns the scraper instance (or None on error) so callers can inspect
+    failed_links or series_data if needed.
+    """
+    try:
+        scraper = BsToScraper()
+        scraper.run(SERIES_INDEX_FILE, **run_kwargs)
+
+        if scraper.series_data:
+            if confirm_and_save_changes(scraper.series_data, description):
+                print(f"\n✓ {success_msg}")
+                print_scraped_series_status()
+                logger.info(success_msg)
+        else:
+            print(f"\n⚠ {no_data_msg}")
+            logger.warning(no_data_msg)
+
+        if scraper.failed_links:
+            print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
+
+        return scraper
+    except OSError as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error in {description}: {e}")
+    except KeyboardInterrupt:
+        print("\n⚠ Scraping interrupted by user")
+        logger.info(f"{description} interrupted by user")
+    except Exception as e:
+        print(f"\n✗ Unexpected error: {str(e)}")
+        logger.error(f"Unexpected error in {description}: {e}")
+    return None
+
+
 def scrape_series():
     """Execute series scraping with optional resume from checkpoint"""
     print("\n→ Starting BS.TO scraper...")
     print("  (Browser will open - do not close it manually)\n")
-    
-    try:
-        # Check if checkpoint exists
-        checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
-        resume = False
-        if os.path.exists(checkpoint_file):
-            print("⚠ Checkpoint found from previous run!\n")
-            choice = input("Resume from checkpoint? (y/n): ").strip().lower()
-            resume = choice == 'y'
-        
-        # Validate user input for scraping mode
-        print("\nScraping mode:")
-        print("  1. Sequential (slower, but most reliable)")
-        print("  2. Parallel (faster, uses multiple workers)\n")
-        mode_choice = input("Choose mode (1-2) [default: 2]: ").strip() or '2'
-        
-        if mode_choice not in ['1', '2']:
-            print("⚠ Invalid choice, using default (parallel)")
-            use_parallel = True
-        else:
-            use_parallel = mode_choice == '2'
-        
-        scraper = BsToScraper()
-        scraper.run(SERIES_INDEX_FILE, resume_only=resume, parallel=use_parallel)
-        
-        # Use scraped data directly from scraper and confirm before saving
-        if scraper.series_data:
-            if confirm_and_save_changes(scraper.series_data, "Scraped data"):
-                print("\n✓ Scraping completed successfully!")
-                print_scraped_series_status()
-                logger.info("Scraping completed successfully")
-        else:
-            print("\n⚠ No data scraped")
-            logger.warning("No data scraped during scraping operation")
-        
-        # Offer to retry failed series with a fresh login (hooks into option 6)
-        if scraper.failed_links:
-            print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
-            print("→ Use option 6 (Retry failed series) to rescrape these later.")
-            # The failed series are already saved by the scraper
-        
-    except OSError as e:
-        print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error in scrape_series: {e}")
-    except KeyboardInterrupt:
-        print("\n⚠ Scraping interrupted by user")
-        logger.info("Scraping interrupted by user")
-    except Exception as e:
-        print(f"\n✗ Unexpected error during scraping: {str(e)}")
-        logger.error(f"Unexpected error in scrape_series: {e}")
+
+    # Check if checkpoint exists
+    checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
+    resume = False
+    if os.path.exists(checkpoint_file):
+        print("⚠ Checkpoint found from previous run!\n")
+        choice = input("Resume from checkpoint? (y/n): ").strip().lower()
+        resume = choice == 'y'
+
+    # Validate user input for scraping mode
+    print("\nScraping mode:")
+    print("  1. Sequential (slower, but most reliable)")
+    print("  2. Parallel (faster, uses multiple workers)\n")
+    mode_choice = input("Choose mode (1-2) [default: 2]: ").strip() or '2'
+
+    if mode_choice not in ['1', '2']:
+        print("⚠ Invalid choice, using default (parallel)")
+        use_parallel = True
+    else:
+        use_parallel = mode_choice == '2'
+
+    _run_scrape_and_save(
+        run_kwargs=dict(resume_only=resume, parallel=use_parallel),
+        description="Scraped data",
+        success_msg="Scraping completed successfully!",
+        no_data_msg="No data scraped",
+    )
 
 
 def scrape_new_series():
     """Execute scraping only for new series not yet in the index"""
     print("\n→ Starting BS.TO scraper (NEW series only)...")
     print("  (Browser will open - do not close it manually)\n")
-    
-    try:
-        scraper = BsToScraper()
-        scraper.run(SERIES_INDEX_FILE, new_only=True)
 
-        # Use scraped data directly from scraper and confirm before saving
-        if scraper.series_data:
-            if confirm_and_save_changes(scraper.series_data, "New series data"):
-                print("\n✓ New series scraping completed successfully!")
-                print_scraped_series_status()
-                logger.info("New series scraping completed successfully")
-        else:
-            print("\n⚠ No new series found")
-            logger.warning("No new series found during scraping operation")
-        
-        # Offer to retry failed series with a fresh login (hooks into option 6)
-        if scraper.failed_links:
-            print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
-            print("→ Use option 6 (Retry failed series) to rescrape these later.")
-            # The failed series are already saved by the scraper
-    except OSError as e:
-        print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error in scrape_new_series: {e}")
-    except KeyboardInterrupt:
-        print("\n⚠ Scraping interrupted by user")
-        logger.info("New series scraping interrupted by user")
-    except Exception as e:
-        print(f"\n✗ Unexpected error during new-only scraping: {str(e)}")
-        logger.error(f"Unexpected error in scrape_new_series: {e}")
+    _run_scrape_and_save(
+        run_kwargs=dict(new_only=True),
+        description="New series data",
+        success_msg="New series scraping completed successfully!",
+        no_data_msg="No new series found",
+    )
 
 
 def generate_report():
@@ -293,70 +284,49 @@ def add_series_by_url():
     
     print("\n→ Starting scraper for single series...")
     print("  (Browser will open - do not close it manually)\n")
-    
-    try:
-        scraper = BsToScraper()
-        scraper.run(SERIES_INDEX_FILE, single_url=url)
-        # Use scraped data directly from scraper and confirm before saving
-        if scraper.series_data:
-            if confirm_and_save_changes(scraper.series_data, "Series data"):
-                # Print watched/total episodes for the updated series
-                series = None
-                # scraper.series_data may be a list or dict
-                if isinstance(scraper.series_data, list):
-                    for s in scraper.series_data:
-                        if s.get('url') == url or s.get('link') == url:
-                            series = s
-                            break
-                    if not series and len(scraper.series_data) == 1:
-                        series = scraper.series_data[0]
-                elif isinstance(scraper.series_data, dict):
-                    # Try to find by url or just take the first
-                    for s in scraper.series_data.values():
-                        if s.get('url') == url or s.get('link') == url:
-                            series = s
-                            break
-                    if not series:
-                        series = next(iter(scraper.series_data.values()))
 
-                # After saving, reload the series from the index to get complete merged data
-                index_manager = IndexManager()
-                
-                # Find the scraped series in the index by title or link
-                series_in_index = None
-                if series:
-                    series_title = series.get('title')
-                    series_link = series.get('link')
-                    for indexed_series in index_manager.series_index.values():
-                        if indexed_series.get('title') == series_title or indexed_series.get('link') == series_link:
-                            series_in_index = indexed_series
-                            break
-                
-                if series_in_index:
-                    watched = series_in_index.get('watched_episodes', 0)
-                    total = series_in_index.get('total_episodes', 0)
-                    percent = round((watched / total * 100), 1) if total else 0
-                    print(f"\nStatus for '{series_in_index.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
-                elif series:
-                    watched = series.get('watched_episodes', 0)
-                    total = series.get('total_episodes', 0)
-                    percent = round((watched / total * 100), 1) if total else 0
-                    print(f"\nStatus for '{series.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
-                
-                print("\n✓ Series added/updated successfully!")
-                logger.info(f"Successfully added/updated series: {url}")
-        else:
-            print("\n⚠ No data scraped")
-            logger.warning(f"No data scraped for URL: {url}")
-    except OSError as e:
-        print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error adding series from URL {url}: {e}")
-    except KeyboardInterrupt:
-        print("\n⚠ Series addition interrupted by user")
-        logger.info(f"Series addition interrupted for URL: {url}")
-    except Exception as e:
-        print(f"\n✗ Failed to add series: {str(e)}")
-        logger.error(f"Failed to add series from URL {url}: {e}")
+    scraper = _run_scrape_and_save(
+        run_kwargs=dict(single_url=url),
+        description="Series data",
+        success_msg="Series added/updated successfully!",
+        no_data_msg=f"No data scraped for URL: {url}",
+    )
+
+    # Show episode status for the scraped series
+    if scraper and scraper.series_data:
+        _print_single_series_status(scraper.series_data, url)
+
+
+def _print_single_series_status(series_data, url):
+    """Print watched/total status for a single scraped series."""
+    # Find the series in scraped data
+    series = None
+    if isinstance(series_data, list):
+        series = next(
+            (s for s in series_data if s.get('url') == url or s.get('link') == url),
+            series_data[0] if len(series_data) == 1 else None,
+        )
+    elif isinstance(series_data, dict):
+        series = next(
+            (s for s in series_data.values() if s.get('url') == url or s.get('link') == url),
+            next(iter(series_data.values()), None),
+        )
+
+    if not series:
+        return
+
+    # Prefer merged index data over raw scraped data
+    index_manager = IndexManager()
+    source = next(
+        (s for s in index_manager.series_index.values()
+         if s.get('title') == series.get('title') or s.get('link') == series.get('link')),
+        series,
+    )
+
+    watched = source.get('watched_episodes', 0)
+    total = source.get('total_episodes', 0)
+    percent = round((watched / total * 100), 1) if total else 0
+    print(f"\nStatus for '{source.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
 
 
 def batch_add_series_from_file():
@@ -401,63 +371,34 @@ def batch_add_series_from_file():
     
     print("\n→ Starting batch scraper...")
     print("  (Browser will open - do not close it manually)\n")
-    
-    try:
-        scraper = BsToScraper()
-        scraper.run(SERIES_INDEX_FILE, url_list=urls)
-        
-        # Use scraped data directly from scraper and confirm before saving
-        if scraper.series_data:
-            if confirm_and_save_changes(scraper.series_data, f"Batch data ({len(urls)} series)"):
-                print(f"\n✓ Batch add completed! {len(urls)} series processed.")
-                print_scraped_series_status()
-                logger.info(f"Batch add completed: {len(urls)} series processed")
-        else:
-            print("\n⚠ No data scraped")
-            logger.warning("No data scraped during batch processing")
-    except OSError as e:
-        print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error in batch processing: {e}")
-    except KeyboardInterrupt:
-        print("\n⚠ Batch processing interrupted by user")
-        logger.info("Batch processing interrupted by user")
-    except Exception as e:
-        print(f"\n✗ Batch add failed: {str(e)}")
-        logger.error(f"Batch add failed: {e}")
+
+    _run_scrape_and_save(
+        run_kwargs=dict(url_list=urls),
+        description=f"Batch data ({len(urls)} series)",
+        success_msg=f"Batch add completed! {len(urls)} series processed.",
+        no_data_msg="No data scraped",
+    )
 
 def retry_failed_series():
     """Retry previously failed series"""
     print("\n→ Retry failed series from last run")
     print("  (Browser will open - do not close it manually)\n")
-    
+
     # Pre-check for failed series before launching browser
-    try:
-        scraper = BsToScraper()
-        failed_list = scraper.load_failed_series()
-        if not failed_list:
-            print("✓ No failed series found. Nothing to retry.")
-            return
-        print(f"✓ Found {len(failed_list)} failed series from last run")
-        
-        # Force sequential mode for reliability
-        print("\n→ Starting retry in sequential mode (for reliability)...")
-        scraper.run(SERIES_INDEX_FILE, retry_failed=True, parallel=False)
-        
-        # Use scraped data directly from scraper and confirm before saving
-        if scraper.series_data:
-            if confirm_and_save_changes(scraper.series_data, "Retry data"):
-                print("\n✓ Retry completed successfully!")
-                print_scraped_series_status()
-                logger.info(f"Retry completed successfully for {len(failed_list)} series")
-        else:
-            print("\n⚠ No data to retry")
-            logger.warning("No data to retry in retry_failed_series")
-    except OSError as e:
-        print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error in retry_failed_series: {e}")
-    except Exception as e:
-        print(f"\n✗ Retry failed: {str(e)}")
-        logger.error(f"Retry failed: {e}")
+    temp_scraper = BsToScraper()
+    failed_list = temp_scraper.load_failed_series()
+    if not failed_list:
+        print("✓ No failed series found. Nothing to retry.")
+        return
+    print(f"✓ Found {len(failed_list)} failed series from last run")
+    print("\n→ Starting retry in sequential mode (for reliability)...")
+
+    _run_scrape_and_save(
+        run_kwargs=dict(retry_failed=True, parallel=False),
+        description="Retry data",
+        success_msg="Retry completed successfully!",
+        no_data_msg="No data to retry",
+    )
 
 
 def pause_scraping():

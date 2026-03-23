@@ -77,7 +77,7 @@ def format_season_ep(season_label, ep_num):
     return f"[{season_label}] Ep {ep_num}"
 
 
-def group_episodes_by_season(episode_list, new_data):
+def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
     """
     Group episodes by series and season, showing count even for partial seasons.
     Returns: list of display strings, already formatted
@@ -93,20 +93,20 @@ def group_episodes_by_season(episode_list, new_data):
     # Convert to dict for new_data lookup
     if isinstance(new_data, list):
         new_data_dict = {s.get('title'): s for s in new_data}
-    else:
+    elif isinstance(new_data, dict):
         new_data_dict = new_data
+    else:
+        new_data_dict = {}
     
     result = []
     for (title, season), ep_nums in sorted(grouped.items()):
         series = new_data_dict.get(title, {})
         total_in_season, watched_in_season = _get_season_stats(series, season)
         if total_in_season > 0:
-            # Always show watched/total at end
-            result.append(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+            result.append(f"  {prefix} {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
         else:
-            # Fallback if we can't find total - list individual episodes
             for ep_num in sorted(ep_nums):
-                result.append(f"  [+] {title} {format_season_ep(season, ep_num)}")
+                result.append(f"  {prefix} {title} {format_season_ep(season, ep_num)}")
     
     return result
 
@@ -212,94 +212,47 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
             paginate_list(changes["new_episodes"], lambda x: f"  + {x[0]} [{x[1]}] Ep {x[2]}")
 
     if changes["newly_watched"] and include_watched:
-        if new_data:
-            grouped = defaultdict(list)
-            for title, season, ep_num in changes["newly_watched"]:
-                grouped[(title, season)].append(ep_num)
-            print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])} episodes)")
-            watched_lines = []
-            for (title, season), ep_nums in grouped.items():
-                series = _find_series(new_data, title)
-                total_in_season, watched_in_season = _get_season_stats(series, season)
-                if total_in_season > 0:
-                    watched_lines.append(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
-                else:
-                    for ep_num in sorted(ep_nums):
-                        watched_lines.append(f"  [+] {title} [{season}] Ep {ep_num}")
-            paginate_list(watched_lines, lambda line: line)
-        else:
-            print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])}) [ungrouped fallback]")
-            paginate_list(changes["newly_watched"], lambda x: f"  [+] {x[0]} [{x[1]}] Ep {x[2]}")
+        print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])} episodes)")
+        watched_lines = group_episodes_by_season(changes["newly_watched"], new_data)
+        paginate_list(watched_lines, lambda line: line)
 
     if changes.get("newly_unwatched"):
-        if new_data:
-            grouped = defaultdict(list)
-            for x in changes["newly_unwatched"]:
-                grouped[(x[0], x[1])].append(x[2])
-            print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])} episodes)")
-            unwatched_lines = []
-            for (title, season), ep_nums in grouped.items():
-                series = _find_series(new_data, title)
-                total_in_season, watched_in_season = _get_season_stats(series, season)
-                if total_in_season > 0:
-                    unwatched_lines.append(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
-                else:
-                    for ep_num in sorted(ep_nums):
-                        unwatched_lines.append(f"  [!] {title} [{season}] Ep {ep_num}")
-            paginate_list(unwatched_lines, lambda line: line)
-        else:
-            print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
-            paginate_list(changes["newly_unwatched"], lambda x: f"  [!] {x[0]} [{x[1]}] Ep {x[2]}")
+        print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])} episodes)")
+        unwatched_lines = group_episodes_by_season(changes["newly_unwatched"], new_data, prefix='[!]')
+        paginate_list(unwatched_lines, lambda line: line)
     
     print("\n" + "="*70)
     return total
 
 
-def confirm_and_save_changes(new_data, description="data"):
-    """
-    Reusable function to show changes, ask for confirmation, and save.
-    Merges new data with existing, preserving watched status by default.
-    Watched→unwatched changes require separate confirmation.
-    
-    Args:
-        new_data: List or dict of series to save
-        description: What we're saving (for messages)
-    
-    Returns:
-        True if saved, False if cancelled
-    """
-
-    # Load current index as old_data
-    old_data = []
-    if os.path.exists(SERIES_INDEX_FILE):
-        try:
-            with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
-                old_data = json.load(f)
-            if not isinstance(old_data, (list, dict)):
-                print(f"\u26a0 Index file is not a valid list or dict, ignoring.")
-                logger.error(f"Index file is not a valid list or dict.")
-                old_data = []
-            logger.info(f"Loaded index from {SERIES_INDEX_FILE} ({len(old_data)} entries)")
-        except Exception as e:
-            print(f"\u26a0 Error loading index: {str(e)}")
-            logger.error(f"Error loading index: {str(e)}")
-            old_data = []
-    else:
+def _load_existing_index():
+    """Load the current series index from disk. Returns a list (or empty list)."""
+    if not os.path.exists(SERIES_INDEX_FILE):
         logger.info(f"No existing index found at {SERIES_INDEX_FILE}")
+        return []
+    try:
+        with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, (list, dict)):
+            print("\u26a0 Index file is not a valid list or dict, ignoring.")
+            logger.error("Index file is not a valid list or dict.")
+            return []
+        logger.info(f"Loaded index from {SERIES_INDEX_FILE} ({len(data)} entries)")
+        return data
+    except Exception as e:
+        print(f"\u26a0 Error loading index: {str(e)}")
+        logger.error(f"Error loading index: {str(e)}")
+        return []
 
-    # Compute changes between old and new data
-    # Ensure new_data is a dict for merging
-    if isinstance(new_data, list):
-        new_dict = {s.get('title'): s for s in new_data}
-    else:
-        new_dict = dict(new_data)
-    changes = print_changes(old_data, new_dict)
-    logger.info(f"Detected changes: { {k: len(v) for k,v in changes.items()} }")
 
-    # Require manual confirmation for ALL changes (watched and unwatched)
+def _prompt_watch_status_changes(changes, new_dict):
+    """Prompt user to confirm watched/unwatched episode changes.
+
+    Returns (allow_watched, allow_unwatched).
+    """
     allow_watched = False
     allow_unwatched = False
-    # Confirm watched (unwatched→watched)
+
     if changes["newly_watched"]:
         logger.info(f"Prompting user to confirm marking {len(changes['newly_watched'])} episodes as watched.")
         print(f"\n[OK] {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
@@ -316,15 +269,13 @@ def confirm_and_save_changes(new_data, description="data"):
             else:
                 print(f"  [+] {title} [{season}]: {len(ep_nums)} episode(s)")
         print("-"*70)
-        watched_response = input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower()
-        if watched_response == 'y':
+        if input("\nAllow these episodes to be marked as WATCHED? (y/n): ").strip().lower() == 'y':
             allow_watched = True
             logger.info("User allowed watched changes.")
         else:
-            print("  → Watched changes will be ignored (episodes stay unwatched)")
+            print("  \u2192 Watched changes will be ignored (episodes stay unwatched)")
             logger.info("User denied watched changes.")
 
-    # Confirm unwatched (watched→unwatched)
     if changes["newly_unwatched"]:
         logger.info(f"Prompting user to confirm marking {len(changes['newly_unwatched'])} episodes as unwatched.")
         print(f"\n[WARN] {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
@@ -341,95 +292,133 @@ def confirm_and_save_changes(new_data, description="data"):
             else:
                 print(f"  [!] {title} [{season}]: {len(ep_nums)} episode(s)")
         print("-"*70)
-        unwatch_response = input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower()
-        if unwatch_response == 'y':
+        if input("\nAllow these episodes to be marked as UNWATCHED? (y/n): ").strip().lower() == 'y':
             allow_unwatched = True
             logger.info("User allowed unwatched changes.")
         else:
-            print("  → Unwatched changes will be ignored (episodes stay watched)")
+            print("  \u2192 Unwatched changes will be ignored (episodes stay watched)")
             logger.info("User denied unwatched changes.")
 
-    # Remove changes not allowed
-    if not allow_watched:
-        changes["newly_watched"] = []
-    if not allow_unwatched:
-        changes["newly_unwatched"] = []
-    # Build merged data (preserve old entries, merge with new)
-    # Ensure old_data is a dict (convert from list if needed)
+    return allow_watched, allow_unwatched
+
+
+def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
+    """Merge new scraped data into the existing index.
+
+    - Preserves all existing series.
+    - Only applies watched/unwatched flips when the corresponding flag is True.
+    - Recalculates episode counts from actual episode data.
+
+    Returns merged dict {title: series}.
+    """
     if isinstance(old_data, list):
         merged = {s.get('title'): s for s in old_data}
     else:
         merged = dict(old_data)
+
     for title, new_entry in new_dict.items():
-        if title in merged:
-            # Merge: only apply watched/unwatched changes if allowed
-            old_entry = merged[title]
-            old_entry['status'] = 'active'
-            old_seasons = {s.get('season'): s for s in old_entry.get('seasons', [])}
-            for new_season in new_entry.get('seasons', []):
-                season_label = new_season.get('season')
-                if season_label in old_seasons:
-                    old_eps = {ep.get('number'): ep for ep in old_seasons[season_label].get('episodes', [])}
-                    merged_episodes = []
-                    for new_ep in new_season.get('episodes', []):
-                        ep_num = new_ep.get('number')
-                        if ep_num in old_eps:
-                            old_watched = old_eps[ep_num].get('watched', False)
-                            new_watched = new_ep.get('watched', False)
-                            # Only allow watched/unwatched changes if confirmed
-                            if allow_watched and (not old_watched and new_watched):
-                                new_ep['watched'] = True
-                            elif allow_unwatched and (old_watched and not new_watched):
-                                new_ep['watched'] = False
-                            else:
-                                new_ep['watched'] = old_watched
-                        merged_episodes.append(new_ep)
-                    old_seasons[season_label]['episodes'] = merged_episodes
-                else:
-                    old_seasons[season_label] = new_season
-            old_entry['seasons'] = list(old_seasons.values())
-            # Recalculate counts from actual episode data (not stale season metadata)
-            old_entry['watched_episodes'] = sum(
-                sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
-                for s in old_entry['seasons']
-            )
-            old_entry['total_episodes'] = sum(
-                len(s.get('episodes', []))
-                for s in old_entry['seasons']
-            )
-            old_entry['url'] = new_entry.get('url', old_entry.get('url'))
-            old_entry['last_updated'] = datetime.now().isoformat()
-        else:
-            # New series
+        if title not in merged:
             new_entry['added_date'] = datetime.now().isoformat()
             new_entry['status'] = 'active'
             merged[title] = new_entry
-    # Show final changes summary (excluding unwatched if not allowed)
+            continue
+
+        old_entry = merged[title]
+        old_entry['status'] = 'active'
+        old_seasons = {s.get('season'): s for s in old_entry.get('seasons', [])}
+
+        for new_season in new_entry.get('seasons', []):
+            season_label = new_season.get('season')
+            if season_label in old_seasons:
+                old_eps = {ep.get('number'): ep for ep in old_seasons[season_label].get('episodes', [])}
+                merged_episodes = []
+                for new_ep in new_season.get('episodes', []):
+                    ep_num = new_ep.get('number')
+                    if ep_num in old_eps:
+                        old_watched = old_eps[ep_num].get('watched', False)
+                        new_watched = new_ep.get('watched', False)
+                        if allow_watched and (not old_watched and new_watched):
+                            new_ep['watched'] = True
+                        elif allow_unwatched and (old_watched and not new_watched):
+                            new_ep['watched'] = False
+                        else:
+                            new_ep['watched'] = old_watched
+                    merged_episodes.append(new_ep)
+                old_seasons[season_label]['episodes'] = merged_episodes
+            else:
+                old_seasons[season_label] = new_season
+
+        old_entry['seasons'] = list(old_seasons.values())
+        old_entry['watched_episodes'] = sum(
+            sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
+            for s in old_entry['seasons']
+        )
+        old_entry['total_episodes'] = sum(
+            len(s.get('episodes', []))
+            for s in old_entry['seasons']
+        )
+        old_entry['url'] = new_entry.get('url', old_entry.get('url'))
+        old_entry['last_updated'] = datetime.now().isoformat()
+
+    return merged
+
+
+def confirm_and_save_changes(new_data, description="data"):
+    """
+    Show changes, ask for confirmation, merge, and save.
+
+    Args:
+        new_data: List or dict of series to save
+        description: What we're saving (for messages)
+
+    Returns:
+        True if saved, False if cancelled
+    """
+    old_data = _load_existing_index()
+
+    if isinstance(new_data, list):
+        new_dict = {s.get('title'): s for s in new_data}
+    else:
+        new_dict = dict(new_data)
+
+    changes = print_changes(old_data, new_dict)
+    logger.info(f"Detected changes: { {k: len(v) for k,v in changes.items()} }")
+
+    allow_watched, allow_unwatched = _prompt_watch_status_changes(changes, new_dict)
+
+    if not allow_watched:
+        changes["newly_watched"] = []
+    if not allow_unwatched:
+        changes["newly_unwatched"] = []
+
+    merged = _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched)
+
+    # Count remaining changes
     main_changes = sum(len(v) for k, v in changes.items() if k != 'newly_unwatched')
     if allow_unwatched:
         main_changes += len(changes['newly_unwatched'])
+
     if main_changes == 0:
-        print(f"\n✓ {description} already up to date.")
+        print(f"\n\u2713 {description} already up to date.")
         logger.info(f"No changes to save for {description}.")
         return True
-    # Display changes (without watched/unwatched sections, already handled above)
+
     display_changes(changes, include_unwatched=False, include_watched=False, new_data=new_dict)
-    # Ask for confirmation
-    response = input(f"\nSave these changes? (y/n): ").strip().lower()
-    if response != 'y':
-        print("✗ Changes discarded. Nothing saved.")
+
+    if input(f"\nSave these changes? (y/n): ").strip().lower() != 'y':
+        print("\u2717 Changes discarded. Nothing saved.")
         logger.info("User discarded changes. Nothing saved.")
         return False
-    # Save merged data
+
     try:
         series_list = list(merged.values())
         with open(SERIES_INDEX_FILE, 'w', encoding='utf-8') as f:
             json.dump(series_list, f, indent=2, ensure_ascii=False)
-        print(f"✓ Saved {len(series_list)} series to index")
+        print(f"\u2713 Saved {len(series_list)} series to index")
         logger.info(f"Saved {len(series_list)} series to {SERIES_INDEX_FILE}")
         return True
     except Exception as e:
-        print(f"✗ Failed to save: {str(e)}")
+        print(f"\u2717 Failed to save: {str(e)}")
         logger.error(f"Failed to save index: {str(e)}")
         return False
 
