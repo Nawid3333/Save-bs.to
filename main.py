@@ -10,8 +10,10 @@ import os
 import logging
 import re
 import subprocess
-from requests.exceptions import RequestException
 from urllib.parse import urlparse
+
+# Pre-compiled regex for URL validation
+_SERIE_URL_RE = re.compile(r'/serie/[^/]+')
 
 # Configure logging
 logging.basicConfig(
@@ -67,7 +69,9 @@ def print_scraped_series_status():
                 watched = s.get('watched_episodes', 0)
                 total = s.get('total_episodes', 0)
                 percent = round((watched / total * 100), 1) if total else 0
-                print(f"  • {s.get('title')}: {watched}/{total} episodes ({percent}%)")
+                season_labels = [str(sn.get('season', '?')) for sn in s.get('seasons', [])]
+                season_info = f" [{','.join(season_labels)}]" if season_labels else ""
+                print(f"  • {s.get('title')}{season_info}: {watched}/{total} episodes ({percent}%)")
     except Exception as e:
         logger.error(f"Error printing series status: {e}")
 
@@ -143,7 +147,7 @@ def scrape_series():
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
             # The failed series are already saved by the scraper
         
-    except RequestException as e:
+    except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in scrape_series: {e}")
     except KeyboardInterrupt:
@@ -178,7 +182,7 @@ def scrape_new_series():
             print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
             # The failed series are already saved by the scraper
-    except RequestException as e:
+    except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in scrape_new_series: {e}")
     except KeyboardInterrupt:
@@ -278,7 +282,7 @@ def add_series_by_url():
                 print("✗ Invalid bs.to URL")
                 continue
             # Require /serie/ in path
-            if not re.search(r"/serie/[^/]+", parsed_url.path):
+            if not _SERIE_URL_RE.search(parsed_url.path):
                 print("✗ URL must be a valid bs.to series page (e.g. https://bs.to/serie/Breaking-Bad)")
                 continue
         except Exception as e:
@@ -344,7 +348,7 @@ def add_series_by_url():
         else:
             print("\n⚠ No data scraped")
             logger.warning(f"No data scraped for URL: {url}")
-    except RequestException as e:
+    except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error adding series from URL {url}: {e}")
     except KeyboardInterrupt:
@@ -411,7 +415,7 @@ def batch_add_series_from_file():
         else:
             print("\n⚠ No data scraped")
             logger.warning("No data scraped during batch processing")
-    except RequestException as e:
+    except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in batch processing: {e}")
     except KeyboardInterrupt:
@@ -448,7 +452,7 @@ def retry_failed_series():
         else:
             print("\n⚠ No data to retry")
             logger.warning("No data to retry in retry_failed_series")
-    except RequestException as e:
+    except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in retry_failed_series: {e}")
     except Exception as e:

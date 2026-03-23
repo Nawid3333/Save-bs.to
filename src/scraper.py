@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -33,6 +34,13 @@ MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))  # Default to 16 workers fo
 USE_PARALLEL = True
 
 
+# Pre-compiled regex for season label detection
+_SEASON_LABEL_RE = re.compile(r'^(staffel|season|s)?\s*\d+$', re.IGNORECASE)
+_SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
+_DOMAIN_STRIP_RE = re.compile(r'^https?://[^/]+')
+_SERIE_PATH_RE = re.compile(r'(/serie/[^/]+)')
+
+
 def is_regular_season(season_label):
     """
     Check if season label is a regular numbered season (Staffel 1, Season 2, etc.)
@@ -41,8 +49,7 @@ def is_regular_season(season_label):
     Returns True for regular seasons that can use the 'assume unwatched' optimization.
     Returns False for special seasons that should always be checked individually.
     """
-    # Match patterns like 'Staffel 1', 'Season 2', 'S1', just '1', '2', etc.
-    return bool(re.search(r'^(staffel|season|s)?\s*\d+$', season_label.strip(), re.IGNORECASE))
+    return bool(_SEASON_LABEL_RE.search(season_label.strip()))
 
 
 def cleanup_geckodriver_processes():
@@ -74,8 +81,15 @@ def cleanup_geckodriver_processes():
         pass
 
 
-# Register safe cleanup on exit
+def _signal_handler(signum, frame):
+    """Convert termination signals into clean exit so atexit handlers run"""
+    sys.exit(0)
+
+
+# Register cleanup handlers
 atexit.register(cleanup_geckodriver_processes)
+signal.signal(signal.SIGINT, _signal_handler)
+signal.signal(signal.SIGTERM, _signal_handler)
 
 
 class BsToScraper:
@@ -89,9 +103,9 @@ class BsToScraper:
         #   /serie/Series-Name/1/de
         #   /serie/Series-Name/1/1/de
         # Remove protocol and domain if present
-        url = re.sub(r"^https?://[^/]+", "", url)
+        url = _DOMAIN_STRIP_RE.sub("", url)
         # Find the /serie/Series-Name part
-        m = re.match(r"(/serie/[^/]+)", url)
+        m = _SERIE_PATH_RE.match(url)
         if m:
             main_path = m.group(1)
         else:
@@ -787,9 +801,6 @@ class BsToScraper:
             season_links = self.get_season_links(page_content, url)
             if not season_links:
                 season_links = [("1", url, "none")]  # Default: needs loading
-            else:
-                season_labels = [item[0] if isinstance(item, tuple) else item for item in season_links]
-                print(f"  Found {len(season_links)} season(s): {season_labels}")
 
             seasons_data = []
             total_watched = 0
@@ -848,7 +859,7 @@ class BsToScraper:
                 link = series_hint.get('link')
             else:
                 parsed = urlparse(url)
-                m = re.match(r'(/serie/[^/]+)', parsed.path)
+                m = _SERIE_PATH_RE.match(parsed.path)
                 if m:
                     link = m.group(1)
                 else:
@@ -941,23 +952,23 @@ class BsToScraper:
                     filled = int(bar_length * idx / len(all_series))
                     bar = '█' * filled + '░' * (bar_length - filled)
                     
-                    print(f"\n[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | {series['title']}")
-                    
                     result = self.process_series_page(series['url'], series_hint=series)
                     if result:
+                        season_labels = [s.get('season', '?') for s in result.get('seasons', [])]
+                        season_info = f" [{','.join(season_labels)}]" if season_labels else ""
                         # Mark empty series
                         if result['total_episodes'] == 0:
                             result['empty'] = True
-                            print(f"  ⚠ {result['title']}: No episodes (marked as empty)")
+                            print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ⚠ {result['title']}{season_info}: No episodes")
                         else:
                             result['empty'] = False
-                            print(f"  ✓ {result['title']}: {result['watched_episodes']}/{result['total_episodes']} watched")
+                            print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ✓ {result['title']}{season_info}: {result['watched_episodes']}/{result['total_episodes']} watched")
                         self.series_data.append(result)
                         # Save checkpoint
                         self.completed_links.add(series.get('link'))
                         self.save_checkpoint()
                     else:
-                        print("  ⚠ Skipped (no data)")
+                        print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ⚠ {series['title']}: Skipped (no data)")
                 except Exception as e:
                     print(f"  ⚠ Error processing {series['title']}: {str(e)}")
                     self.failed_links.append(series)
@@ -1007,7 +1018,7 @@ class BsToScraper:
         pool_sizes = [len(p) for p in worker_pools]
         print(f"→ Pre-partitioned {total_series} series across {worker_count} workers ({min(pool_sizes)}-{max(pool_sizes)} each)")
 
-        def progress_line(done, total, title, watched=None, episode_total=None, empty=False, error=None, worker_id=None):
+        def progress_line(done, total, title, watched=None, episode_total=None, empty=False, error=None, worker_id=None, season_labels=None):
             elapsed = time.time() - start_time
             avg = elapsed / max(1, done + failed)
             remaining = total - (done + failed)
@@ -1017,13 +1028,13 @@ class BsToScraper:
             filled = int(bar_len * (done + failed) / total)
             bar = '█' * filled + '░' * (bar_len - filled)
             worker_info = f" | W{worker_id}/{worker_count}" if worker_id else f" | Workers: {worker_count}"
-            ep_info = f" ({watched}/{episode_total})" if watched is not None and episode_total is not None else ""
+            season_info = f" [{','.join(season_labels)}]" if season_labels else ""
             if error:
                 print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ✗ {title}: {error}")
             elif empty:
-                print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ⚠ {title}: No episodes")
+                print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ⚠ {title}{season_info}: No episodes")
             else:
-                print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ✓ {title}{ep_info}")
+                print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ✓ {title}{season_info}: {watched}/{episode_total} watched")
 
         def worker_loop(worker_id, my_series_list):
             nonlocal completed, failed
@@ -1107,7 +1118,7 @@ class BsToScraper:
                                 self.save_checkpoint()
                             watched = result.get('watched_episodes', 0)
                             total_eps = result.get('total_episodes', 0)
-                            progress_line(completed, total_series, result.get('title', 'Series'), watched=watched, episode_total=total_eps, empty=empty, worker_id=worker_id)
+                            progress_line(completed, total_series, result.get('title', 'Series'), watched=watched, episode_total=total_eps, empty=empty, worker_id=worker_id, season_labels=[s.get('season', '?') for s in result.get('seasons', [])])
                             error_streak = 0
                             tasks_since_check += 1
                             
@@ -1441,7 +1452,7 @@ class BsToScraper:
         for url in urls:
             main_url = self.normalize_to_series_url(url)
             # Extract path-only link (e.g. /serie/Breaking-Bad) for consistent dedup
-            m = re.match(r'https?://[^/]+(/serie/[^/]+)', main_url)
+            m = _SERIE_PATH_RE.search(main_url)
             link_path = m.group(1) if m else main_url
             series_list.append({'title': main_url.split('/')[-1], 'link': link_path, 'url': main_url})
         self.series_data = []

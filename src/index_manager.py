@@ -1,10 +1,13 @@
-﻿import json
+import json
 import os
 import re
 import sys
 import logging
 from datetime import datetime
 from collections import defaultdict
+
+# Pre-compiled regex for season number extraction
+_SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -42,11 +45,11 @@ def paginate_list(items, formatter, page_size=20):
 def format_season_ep(season_label, ep_num):
     """
     Format season/episode for display.
-    - Regular seasons (Staffel 1, Season 2) â†’ S1E5
-    - Special seasons (Specials, OVA, Movies) â†’ [Specials] Ep 3
+    - Regular seasons (Staffel 1, Season 2) → S1E5
+    - Special seasons (Specials, OVA, Movies) → [Specials] Ep 3
     """
     # Try to extract number from season label (Staffel 1, Season 2, etc.)
-    match = re.search(r'(staffel|season|s)\s*(\d+)', season_label, re.IGNORECASE)
+    match = _SEASON_NUMBER_RE.search(season_label)
     if match:
         return f"S{match.group(2)}E{ep_num}"
     else:
@@ -108,8 +111,8 @@ def print_changes(old_data, new_data):
     changes = {
         "new_series": [],
         "new_episodes": [],
-        "newly_watched": [],      # unwatched â†’ watched
-        "newly_unwatched": []     # watched â†’ unwatched (needs separate confirmation)
+        "newly_watched": [],      # unwatched → watched
+        "newly_unwatched": []     # watched → unwatched (needs separate confirmation)
     }
     
     old_titles = set(old_data.keys()) if isinstance(old_data, dict) else {s.get('title') for s in old_data}
@@ -202,7 +205,7 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
             for line in grouped_lines:
                 print(line)
         else:
-            print(f"\nðŸ“º NEW EPISODES ({len(changes['new_episodes'])}) [ungrouped fallback]")
+            print(f"\n📺 NEW EPISODES ({len(changes['new_episodes'])}) [ungrouped fallback]")
             for x in changes["new_episodes"]:
                 print(f"  + {x[0]} [{x[1]}] Ep {x[2]}")
 
@@ -280,7 +283,7 @@ def confirm_and_save_changes(new_data, description="data"):
     """
     Reusable function to show changes, ask for confirmation, and save.
     Merges new data with existing, preserving watched status by default.
-    Watchedâ†’unwatched changes require separate confirmation.
+    Watched→unwatched changes require separate confirmation.
     
     Args:
         new_data: List or dict of series to save
@@ -320,7 +323,7 @@ def confirm_and_save_changes(new_data, description="data"):
     # Require manual confirmation for ALL changes (watched and unwatched)
     allow_watched = False
     allow_unwatched = False
-    # Confirm watched (unwatchedâ†’watched)
+    # Confirm watched (unwatched→watched)
     if changes["newly_watched"]:
         logger.info(f"Prompting user to confirm marking {len(changes['newly_watched'])} episodes as watched.")
         print(f"\n[OK] {len(changes['newly_watched'])} episode(s) would change from UNWATCHED to WATCHED")
@@ -349,10 +352,10 @@ def confirm_and_save_changes(new_data, description="data"):
             allow_watched = True
             logger.info("User allowed watched changes.")
         else:
-            print("  â†’ Watched changes will be ignored (episodes stay unwatched)")
+            print("  → Watched changes will be ignored (episodes stay unwatched)")
             logger.info("User denied watched changes.")
 
-    # Confirm unwatched (watchedâ†’unwatched)
+    # Confirm unwatched (watched→unwatched)
     if changes["newly_unwatched"]:
         logger.info(f"Prompting user to confirm marking {len(changes['newly_unwatched'])} episodes as unwatched.")
         print(f"\n[WARN] {len(changes['newly_unwatched'])} episode(s) would change from WATCHED to UNWATCHED")
@@ -381,7 +384,7 @@ def confirm_and_save_changes(new_data, description="data"):
             allow_unwatched = True
             logger.info("User allowed unwatched changes.")
         else:
-            print("  â†’ Unwatched changes will be ignored (episodes stay watched)")
+            print("  → Unwatched changes will be ignored (episodes stay watched)")
             logger.info("User denied unwatched changes.")
 
     # Remove changes not allowed
@@ -444,7 +447,7 @@ def confirm_and_save_changes(new_data, description="data"):
     if allow_unwatched:
         main_changes += len(changes['newly_unwatched'])
     if main_changes == 0:
-        print(f"\nâœ“ {description} already up to date.")
+        print(f"\n✓ {description} already up to date.")
         logger.info(f"No changes to save for {description}.")
         return True
     # Display changes (without watched/unwatched sections, already handled above)
@@ -452,7 +455,7 @@ def confirm_and_save_changes(new_data, description="data"):
     # Ask for confirmation
     response = input(f"\nSave these changes? (y/n): ").strip().lower()
     if response != 'y':
-        print("âœ— Changes discarded. Nothing saved.")
+        print("✗ Changes discarded. Nothing saved.")
         logger.info("User discarded changes. Nothing saved.")
         return False
     # Save merged data
@@ -460,11 +463,11 @@ def confirm_and_save_changes(new_data, description="data"):
         series_list = list(merged.values())
         with open(SERIES_INDEX_FILE, 'w', encoding='utf-8') as f:
             json.dump(series_list, f, indent=2, ensure_ascii=False)
-        print(f"âœ“ Saved {len(series_list)} series to index")
+        print(f"✓ Saved {len(series_list)} series to index")
         logger.info(f"Saved {len(series_list)} series to {SERIES_INDEX_FILE}")
         return True
     except Exception as e:
-        print(f"âœ— Failed to save: {str(e)}")
+        print(f"✗ Failed to save: {str(e)}")
         logger.error(f"Failed to save index: {str(e)}")
         return False
 
