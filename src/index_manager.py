@@ -10,6 +10,26 @@ from collections import defaultdict
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
 
+def _find_series(new_data, title):
+    """Look up a series by title in either a dict or list."""
+    if isinstance(new_data, dict):
+        return new_data.get(title)
+    if isinstance(new_data, list):
+        return next((s for s in new_data if s.get('title') == title), None)
+    return None
+
+
+def _get_season_stats(series, season_label):
+    """Get (total_episodes, watched_episodes) for a specific season."""
+    if not series:
+        return 0, 0
+    for s in series.get('seasons', []):
+        if s.get('season') == season_label:
+            eps = s.get('episodes', [])
+            return len(eps), sum(1 for ep in eps if ep.get('watched', False))
+    return 0, 0
+
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import SERIES_INDEX_FILE, DATA_DIR
 
@@ -24,7 +44,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 
-def paginate_list(items, formatter, page_size=20):
+def paginate_list(items, formatter, page_size=50):
     """Show items with pagination, Enter = next page, q = skip"""
     if not items:
         return
@@ -46,15 +66,15 @@ def format_season_ep(season_label, ep_num):
     """
     Format season/episode for display.
     - Regular seasons (Staffel 1, Season 2) → S1E5
+    - Numeric-only seasons (1, 2) → S1E5
     - Special seasons (Specials, OVA, Movies) → [Specials] Ep 3
     """
-    # Try to extract number from season label (Staffel 1, Season 2, etc.)
-    match = _SEASON_NUMBER_RE.search(season_label)
+    match = _SEASON_NUMBER_RE.search(str(season_label))
     if match:
         return f"S{match.group(2)}E{ep_num}"
-    else:
-        # Special season - show full label
-        return f"[{season_label}] Ep {ep_num}"
+    if str(season_label).strip().isdigit():
+        return f"S{season_label}E{ep_num}"
+    return f"[{season_label}] Ep {ep_num}"
 
 
 def group_episodes_by_season(episode_list, new_data):
@@ -78,16 +98,8 @@ def group_episodes_by_season(episode_list, new_data):
     
     result = []
     for (title, season), ep_nums in sorted(grouped.items()):
-        # Get total episodes in this season from new_data
         series = new_data_dict.get(title, {})
-        total_in_season = 0
-        watched_in_season = 0
-        for s in series.get('seasons', []):
-            if s.get('season') == season:
-                total_in_season = len(s.get('episodes', []))
-                watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                break
-        count = len(ep_nums)
+        total_in_season, watched_in_season = _get_season_stats(series, season)
         if total_in_season > 0:
             # Always show watched/total at end
             result.append(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
@@ -182,15 +194,7 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
         def format_new_series(title):
             if not new_data:
                 return f"  + {title}"
-            # Find the series entry in new_data
-            series = None
-            if isinstance(new_data, list):
-                for s in new_data:
-                    if s.get('title') == title:
-                        series = s
-                        break
-            elif isinstance(new_data, dict):
-                series = new_data.get(title)
+            series = _find_series(new_data, title)
             if not series:
                 return f"  + {title}"
             watched = series.get('watched_episodes', 0)
@@ -202,12 +206,10 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
         if new_data:
             grouped_lines = group_episodes_by_season([(x[0], x[1], x[2]) for x in changes["new_episodes"]], new_data)
             print(f"\n[NEW EPISODES] ({len(changes['new_episodes'])})")
-            for line in grouped_lines:
-                print(line)
+            paginate_list(grouped_lines, lambda line: line)
         else:
-            print(f"\n📺 NEW EPISODES ({len(changes['new_episodes'])}) [ungrouped fallback]")
-            for x in changes["new_episodes"]:
-                print(f"  + {x[0]} [{x[1]}] Ep {x[2]}")
+            print(f"\n[NEW EPISODES] ({len(changes['new_episodes'])}) [ungrouped fallback]")
+            paginate_list(changes["new_episodes"], lambda x: f"  + {x[0]} [{x[1]}] Ep {x[2]}")
 
     if changes["newly_watched"] and include_watched:
         if new_data:
@@ -215,32 +217,19 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
             for title, season, ep_num in changes["newly_watched"]:
                 grouped[(title, season)].append(ep_num)
             print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])} episodes)")
+            watched_lines = []
             for (title, season), ep_nums in grouped.items():
-                series = None
-                if isinstance(new_data, list):
-                    for s in new_data:
-                        if s.get('title') == title:
-                            series = s
-                            break
-                else:
-                    series = new_data.get(title)
-                total_in_season = 0
-                watched_in_season = 0
-                if series:
-                    for s in series.get('seasons', []):
-                        if s.get('season') == season:
-                            total_in_season = len(s.get('episodes', []))
-                            watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                            break
+                series = _find_series(new_data, title)
+                total_in_season, watched_in_season = _get_season_stats(series, season)
                 if total_in_season > 0:
-                    print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                    watched_lines.append(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
                 else:
                     for ep_num in sorted(ep_nums):
-                        print(f"  [+] {title} [{season}] Ep {ep_num}")
+                        watched_lines.append(f"  [+] {title} [{season}] Ep {ep_num}")
+            paginate_list(watched_lines, lambda line: line)
         else:
             print(f"\n[NEWLY WATCHED] ({len(changes['newly_watched'])}) [ungrouped fallback]")
-            for x in changes["newly_watched"]:
-                print(f"  [+] {x[0]} [{x[1]}] Ep {x[2]}")
+            paginate_list(changes["newly_watched"], lambda x: f"  [+] {x[0]} [{x[1]}] Ep {x[2]}")
 
     if changes.get("newly_unwatched"):
         if new_data:
@@ -248,32 +237,19 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
             for x in changes["newly_unwatched"]:
                 grouped[(x[0], x[1])].append(x[2])
             print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])} episodes)")
+            unwatched_lines = []
             for (title, season), ep_nums in grouped.items():
-                series = None
-                if isinstance(new_data, list):
-                    for s in new_data:
-                        if s.get('title') == title:
-                            series = s
-                            break
-                else:
-                    series = new_data.get(title)
-                total_in_season = 0
-                watched_in_season = 0
-                if series:
-                    for s in series.get('seasons', []):
-                        if s.get('season') == season:
-                            total_in_season = len(s.get('episodes', []))
-                            watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                            break
+                series = _find_series(new_data, title)
+                total_in_season, watched_in_season = _get_season_stats(series, season)
                 if total_in_season > 0:
-                    print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
+                    unwatched_lines.append(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
                 else:
                     for ep_num in sorted(ep_nums):
-                        print(f"  [!] {title} [{season}] Ep {ep_num}")
+                        unwatched_lines.append(f"  [!] {title} [{season}] Ep {ep_num}")
+            paginate_list(unwatched_lines, lambda line: line)
         else:
             print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])}) [ungrouped fallback]")
-            for x in changes["newly_unwatched"]:
-                print(f"  [!] {x[0]} [{x[1]}] Ep {x[2]}")
+            paginate_list(changes["newly_unwatched"], lambda x: f"  [!] {x[0]} [{x[1]}] Ep {x[2]}")
     
     print("\n" + "="*70)
     return total
@@ -334,14 +310,7 @@ def confirm_and_save_changes(new_data, description="data"):
             grouped[(x[0], x[1])].append(x[2])
         for (title, season), ep_nums in grouped.items():
             series = new_dict.get(title)
-            total_in_season = 0
-            watched_in_season = 0
-            if series:
-                for s in series.get('seasons', []):
-                    if s.get('season') == season:
-                        total_in_season = len(s.get('episodes', []))
-                        watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                        break
+            total_in_season, watched_in_season = _get_season_stats(series, season)
             if total_in_season > 0:
                 print(f"  [+] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
             else:
@@ -366,14 +335,7 @@ def confirm_and_save_changes(new_data, description="data"):
             grouped[(x[0], x[1])].append(x[2])
         for (title, season), ep_nums in grouped.items():
             series = new_dict.get(title)
-            total_in_season = 0
-            watched_in_season = 0
-            if series:
-                for s in series.get('seasons', []):
-                    if s.get('season') == season:
-                        total_in_season = len(s.get('episodes', []))
-                        watched_in_season = sum(1 for ep in s.get('episodes', []) if ep.get('watched', False))
-                        break
+            total_in_season, watched_in_season = _get_season_stats(series, season)
             if total_in_season > 0:
                 print(f"  [!] {title} [{season}]: {watched_in_season}/{total_in_season} episodes")
             else:
