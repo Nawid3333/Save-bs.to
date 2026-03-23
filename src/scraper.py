@@ -128,6 +128,7 @@ class BsToScraper:
         self.failed_links = []
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
         self._worker_lock = threading.Lock()  # Protects worker_pids dict/file writes
+        self._checkpoint_mode = None  # Track which menu option created the checkpoint
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
@@ -279,7 +280,10 @@ class BsToScraper:
         Uses atomic write to prevent corruption if process is killed mid-write.
         """
         try:
-            checkpoint_data = {'completed_links': list(self.completed_links)}
+            checkpoint_data = {
+                'completed_links': list(self.completed_links),
+                'mode': self._checkpoint_mode,
+            }
             self._atomic_write_json(self.checkpoint_file, checkpoint_data)
         except Exception:
             pass
@@ -293,6 +297,7 @@ class BsToScraper:
                 data = json.load(f)
             if isinstance(data, dict) and 'completed_links' in data:
                 self.completed_links = set(data.get('completed_links', []))
+                self._checkpoint_mode = data.get('mode')
                 return True
             elif isinstance(data, list):
                 # Backward compatibility: treat as list of completed links
@@ -312,6 +317,19 @@ class BsToScraper:
                 os.remove(self.checkpoint_file)
         except Exception:
             pass
+
+    @staticmethod
+    def get_checkpoint_mode(data_dir):
+        """Read checkpoint mode without fully loading the scraper."""
+        path = os.path.join(data_dir, '.scrape_checkpoint.json')
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return data.get('mode') if isinstance(data, dict) else None
+        except Exception:
+            return None
     
     def save_failed_series(self):
         """Save failed series links for later retry.
@@ -935,6 +953,15 @@ class BsToScraper:
     
     def _scrape_series_sequential(self, all_series):
         """Sequential scraping with progress bar and ETA"""
+        # Filter out already-completed series (from checkpoint resume)
+        if self.completed_links:
+            before = len(all_series)
+            all_series = [s for s in all_series if s.get('link') not in self.completed_links]
+            if before != len(all_series):
+                print(f"  Skipping {before - len(all_series)} already-completed series")
+            if not all_series:
+                print("✓ All series already scraped (from checkpoint)")
+                return
         start_time = time.time()
         try:
             for idx, series in enumerate(all_series, 1):
@@ -995,6 +1022,16 @@ class BsToScraper:
         # Clear any leftover pause file from previous runs
         self.clear_pause_request()
         
+        # Filter out already-completed series (from checkpoint resume)
+        if self.completed_links:
+            before = len(all_series)
+            all_series = [s for s in all_series if s.get('link') not in self.completed_links]
+            if before != len(all_series):
+                print(f"  Skipping {before - len(all_series)} already-completed series")
+            if not all_series:
+                print("✓ All series already scraped (from checkpoint)")
+                return
+
         self.series_data = []
         start_time = time.time()
         completed = 0
@@ -1468,22 +1505,29 @@ class BsToScraper:
             self.setup_driver()
             self.login()
             
+            if resume_only:
+                if self.load_checkpoint():
+                    print(f"→ Resuming from checkpoint ({len(self.completed_links)} series already done)")
+                else:
+                    print("⚠ No checkpoint found. Starting fresh...")
+
             if single_url:
+                self._checkpoint_mode = 'single'
                 self.scrape_single_series(single_url)
             elif url_list:
+                self._checkpoint_mode = 'batch'
                 self.scrape_multiple_series(url_list)
+            elif retry_failed:
+                self._checkpoint_mode = 'retry'
+                print("→ Running in 'retry failed series' mode")
+                self.scrape_retry_failed(output_file)
+            elif new_only:
+                self._checkpoint_mode = 'new_only'
+                print("→ Running in 'new series only' mode")
+                self.scrape_new_series_only()
             else:
-                if retry_failed:
-                    print("→ Running in 'retry failed series' mode")
-                    self.scrape_retry_failed(output_file)
-                elif resume_only:
-                    print("→ Running in 'resume from checkpoint' mode")
-                    self.scrape_resume_checkpoint()
-                elif new_only:
-                    print("→ Running in 'new series only' mode")
-                    self.scrape_new_series_only()
-                else:
-                    self.scrape_series_list()
+                self._checkpoint_mode = 'all_series'
+                self.scrape_series_list()
             
             self.clear_checkpoint()
             # Only clear failed series file if no failures remain

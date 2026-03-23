@@ -31,6 +31,15 @@ from config.config import SERIES_INDEX_FILE, USERNAME, PASSWORD, DATA_DIR
 from src.scraper import BsToScraper
 from src.index_manager import IndexManager, confirm_and_save_changes
 
+# Human-readable labels for each checkpoint mode
+_MODE_LABELS = {
+    'all_series': 'Scrape all series',
+    'new_only': 'Scrape new series only',
+    'single': 'Add single series by URL',
+    'batch': 'Batch add from file',
+    'retry': 'Retry failed series',
+}
+
 
 def print_header():
     """Print application header"""
@@ -102,6 +111,43 @@ def show_menu():
     print("  9. Exit\n")
 
 
+def _check_checkpoint(expected_mode):
+    """Check if a checkpoint exists and whether it matches the expected mode.
+
+    Returns True if we should proceed (no checkpoint, or user chose to resume/discard).
+    Returns False if the user cancelled.
+    Sets the returned dict's 'resume' key when the user wants to resume.
+    """
+    saved_mode = BsToScraper.get_checkpoint_mode(DATA_DIR)
+    if saved_mode is None:
+        return {'ok': True, 'resume': False}
+
+    saved_label = _MODE_LABELS.get(saved_mode, saved_mode)
+    expected_label = _MODE_LABELS.get(expected_mode, expected_mode)
+
+    if saved_mode == expected_mode:
+        print(f"\n⚠ Checkpoint found from a previous \"{saved_label}\" run!\n")
+        choice = input("Resume from checkpoint? (y/n): ").strip().lower()
+        if choice == 'y':
+            return {'ok': True, 'resume': True}
+        # User declined resume — ask whether to discard
+        discard = input("Discard old checkpoint and start fresh? (y/n): ").strip().lower()
+        if discard == 'y':
+            scraper = BsToScraper()
+            scraper.clear_checkpoint()
+            return {'ok': True, 'resume': False}
+        return {'ok': False, 'resume': False}
+    else:
+        print(f"\n⚠ A checkpoint exists from a different mode: \"{saved_label}\"")
+        print(f"   You are about to run: \"{expected_label}\"\n")
+        discard = input("Discard the old checkpoint and continue? (y/n): ").strip().lower()
+        if discard == 'y':
+            scraper = BsToScraper()
+            scraper.clear_checkpoint()
+            return {'ok': True, 'resume': False}
+        return {'ok': False, 'resume': False}
+
+
 def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
     """Common pattern: create scraper, run, confirm & save, handle errors.
     
@@ -143,13 +189,12 @@ def scrape_series():
     print("\n→ Starting BS.TO scraper...")
     print("  (Browser will open - do not close it manually)\n")
 
-    # Check if checkpoint exists
-    checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
-    resume = False
-    if os.path.exists(checkpoint_file):
-        print("⚠ Checkpoint found from previous run!\n")
-        choice = input("Resume from checkpoint? (y/n): ").strip().lower()
-        resume = choice == 'y'
+    # Check checkpoint mode
+    chk = _check_checkpoint('all_series')
+    if not chk['ok']:
+        print("✗ Cancelled")
+        return
+    resume = chk['resume']
 
     # Validate user input for scraping mode
     print("\nScraping mode:")
@@ -176,8 +221,13 @@ def scrape_new_series():
     print("\n→ Starting BS.TO scraper (NEW series only)...")
     print("  (Browser will open - do not close it manually)\n")
 
+    chk = _check_checkpoint('new_only')
+    if not chk['ok']:
+        print("✗ Cancelled")
+        return
+
     _run_scrape_and_save(
-        run_kwargs=dict(new_only=True),
+        run_kwargs=dict(new_only=True, resume_only=chk['resume']),
         description="New series data",
         success_msg="New series scraping completed successfully!",
         no_data_msg="No new series found",
@@ -372,8 +422,13 @@ def batch_add_series_from_file():
     print("\n→ Starting batch scraper...")
     print("  (Browser will open - do not close it manually)\n")
 
+    chk = _check_checkpoint('batch')
+    if not chk['ok']:
+        print("✗ Cancelled")
+        return
+
     _run_scrape_and_save(
-        run_kwargs=dict(url_list=urls),
+        run_kwargs=dict(url_list=urls, resume_only=chk['resume']),
         description=f"Batch data ({len(urls)} series)",
         success_msg=f"Batch add completed! {len(urls)} series processed.",
         no_data_msg="No data scraped",
@@ -393,8 +448,13 @@ def retry_failed_series():
     print(f"✓ Found {len(failed_list)} failed series from last run")
     print("\n→ Starting retry in sequential mode (for reliability)...")
 
+    chk = _check_checkpoint('retry')
+    if not chk['ok']:
+        print("✗ Cancelled")
+        return
+
     _run_scrape_and_save(
-        run_kwargs=dict(retry_failed=True, parallel=False),
+        run_kwargs=dict(retry_failed=True, parallel=False, resume_only=chk['resume']),
         description="Retry data",
         success_msg="Retry completed successfully!",
         no_data_msg="No data to retry",
