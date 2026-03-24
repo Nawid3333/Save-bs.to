@@ -76,7 +76,7 @@ def cleanup_stale_worker_pids():
     try:
         with open(worker_pids_file, 'r') as f:
             pids = json.load(f)
-        if not pids:
+        if not isinstance(pids, dict) or not pids:
             os.remove(worker_pids_file)
             return
         any_alive = False
@@ -111,6 +111,8 @@ def cleanup_geckodriver_processes():
         try:
             with open(worker_pids_file, 'r') as f:
                 pids = json.load(f)
+            if not isinstance(pids, dict):
+                pids = {}
             for worker_id, pid in pids.items():
                 try:
                     if sys.platform == 'win32':
@@ -887,7 +889,7 @@ class BsToScraper:
                 season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
-                    max_retries = int(self.get_timing('max_retries_season') or 3)
+                    max_retries = int(self.get_timing('max_retries_season') or 0) or 3
                     episodes = []
                     season_failed = True
                     
