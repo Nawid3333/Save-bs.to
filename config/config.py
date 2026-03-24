@@ -13,6 +13,11 @@ PASSWORD = os.getenv("BS_PASSWORD", "")
 DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "data")
 SERIES_INDEX_FILE = os.path.join(DATA_DIR, "series_index.json")
 
+# Logs directory
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "..", "logs")
+os.makedirs(LOGS_DIR, exist_ok=True)
+LOG_FILE = os.path.join(LOGS_DIR, "bs_to_backup.log")
+
 # Load selectors configuration
 CONFIG_DIR = os.path.dirname(__file__)
 SELECTORS_CONFIG_FILE = os.path.join(CONFIG_DIR, "selectors_config.json")

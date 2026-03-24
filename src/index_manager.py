@@ -1,12 +1,14 @@
 import json
+import logging
 import os
 import re
-import sys
-import logging
-from datetime import datetime
 from collections import defaultdict
+from datetime import datetime
 
-# Pre-compiled regex for season number extraction
+from config.config import SERIES_INDEX_FILE, DATA_DIR
+
+logger = logging.getLogger(__name__)
+
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
 
@@ -30,22 +32,8 @@ def _get_season_stats(series, season_label):
     return 0, 0
 
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config.config import SERIES_INDEX_FILE, DATA_DIR
-
-# Setup logging - use named logger to avoid conflicting with main.py's basicConfig
-LOG_FILE = os.path.join(DATA_DIR, 'index_manager.log')
-os.makedirs(DATA_DIR, exist_ok=True)
-logger = logging.getLogger('index_manager')
-if not logger.handlers:
-    _fh = logging.FileHandler(LOG_FILE)
-    _fh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s: %(message)s', datefmt='%Y-%m-%d %H:%M:%S'))
-    logger.addHandler(_fh)
-    logger.setLevel(logging.INFO)
-
-
 def paginate_list(items, formatter, page_size=50):
-    """Show items with pagination, Enter = next page, q = skip"""
+    """Print items with pagination; Enter = next page, q = skip."""
     if not items:
         return
     total = len(items)
@@ -63,12 +51,7 @@ def paginate_list(items, formatter, page_size=50):
 
 
 def format_season_ep(season_label, ep_num):
-    """
-    Format season/episode for display.
-    - Regular seasons (Staffel 1, Season 2) → S1E5
-    - Numeric-only seasons (1, 2) → S1E5
-    - Special seasons (Specials, OVA, Movies) → [Specials] Ep 3
-    """
+    """Format season/episode for display (e.g. S1E5, [Specials] Ep 3)."""
     match = _SEASON_NUMBER_RE.search(str(season_label))
     if match:
         return f"S{match.group(2)}E{ep_num}"
@@ -78,10 +61,7 @@ def format_season_ep(season_label, ep_num):
 
 
 def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
-    """
-    Group episodes by series and season, showing count even for partial seasons.
-    Returns: list of display strings, already formatted
-    """
+    """Group (title, season, ep_num) tuples by season and format for display."""
     
     # Group by (title, season)
     grouped = defaultdict(list)
@@ -112,13 +92,10 @@ def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
 
 
 def print_changes(old_data, new_data):
-    """
-    Detect and print changes between old and new data with pagination.
-    Returns dict with change counts.
-    
-    Note: We don't track "removed series" because the merge logic preserves all
-    existing series. Partial scrapes (single URL, batch) would incorrectly show
-    all non-scraped series as "removed".
+    """Detect changes between old and new data. Returns dict of change lists.
+
+    Does not track 'removed series' because partial scrapes would
+    incorrectly show all non-scraped series as removed.
     """
     changes = {
         "new_series": [],
@@ -174,7 +151,7 @@ def print_changes(old_data, new_data):
 
 
 def display_changes(changes, include_unwatched=True, include_watched=True, new_data=None):
-    """Display changes with pagination and smart season grouping"""
+    """Print formatted change summary with pagination."""
     total = 0
     for k, v in changes.items():
         if k == 'newly_unwatched' and not include_unwatched:
@@ -216,7 +193,7 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
         watched_lines = group_episodes_by_season(changes["newly_watched"], new_data)
         paginate_list(watched_lines, lambda line: line)
 
-    if changes.get("newly_unwatched"):
+    if changes.get("newly_unwatched") and include_unwatched:
         print(f"\n[SITE REPORTS UNWATCHED] ({len(changes['newly_unwatched'])} episodes)")
         unwatched_lines = group_episodes_by_season(changes["newly_unwatched"], new_data, prefix='[!]')
         paginate_list(unwatched_lines, lambda line: line)
@@ -226,7 +203,7 @@ def display_changes(changes, include_unwatched=True, include_watched=True, new_d
 
 
 def _load_existing_index():
-    """Load the current series index from disk. Returns a list (or empty list)."""
+    """Load the current series index from disk (list or empty list)."""
     if not os.path.exists(SERIES_INDEX_FILE):
         logger.info(f"No existing index found at {SERIES_INDEX_FILE}")
         return []
@@ -246,10 +223,7 @@ def _load_existing_index():
 
 
 def _prompt_watch_status_changes(changes, new_dict):
-    """Prompt user to confirm watched/unwatched episode changes.
-
-    Returns (allow_watched, allow_unwatched).
-    """
+    """Prompt user to confirm watched/unwatched flips. Returns (allow_watched, allow_unwatched)."""
     allow_watched = False
     allow_unwatched = False
 
@@ -305,10 +279,8 @@ def _prompt_watch_status_changes(changes, new_dict):
 def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
     """Merge new scraped data into the existing index.
 
-    - Preserves all existing series.
-    - Only applies watched/unwatched flips when the corresponding flag is True.
-    - Recalculates episode counts from actual episode data.
-
+    Preserves all existing series and only applies watched/unwatched
+    flips when the corresponding flag is True.
     Returns merged dict {title: series}.
     """
     if isinstance(old_data, list):
@@ -364,16 +336,7 @@ def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
 
 
 def confirm_and_save_changes(new_data, description="data"):
-    """
-    Show changes, ask for confirmation, merge, and save.
-
-    Args:
-        new_data: List or dict of series to save
-        description: What we're saving (for messages)
-
-    Returns:
-        True if saved, False if cancelled
-    """
+    """Show changes, prompt for confirmation, merge, and save. Returns True if saved."""
     old_data = _load_existing_index()
 
     if isinstance(new_data, list):
@@ -433,10 +396,7 @@ class IndexManager:
         os.makedirs(DATA_DIR, exist_ok=True)
 
     def load_index(self):
-        """
-        Load the series index from file, handling both list and dict formats.
-        Always converts to a dict mapping titles to series objects for internal use.
-        """
+        """Load series index from JSON, converting both list and dict formats to dict."""
         self.series_index = {}
         if os.path.exists(SERIES_INDEX_FILE):
             try:
@@ -467,7 +427,7 @@ class IndexManager:
                 self.series_index = {}
 
     def get_statistics(self):
-        """Enhanced statistics with detailed analytics"""
+        """Return detailed analytics about the series index."""
         series_with_progress = self.get_series_with_progress()
         total = len(series_with_progress)
         
@@ -541,7 +501,7 @@ class IndexManager:
         }
         
     def get_full_report(self):
-        """Generate a comprehensive report with detailed analytics"""
+        """Generate a comprehensive report with categories and insights."""
         series_progress = self.get_series_with_progress()
         stats = self.get_statistics()
         
@@ -558,11 +518,6 @@ class IndexManager:
         not_started_titles = sorted([s['title'] for s in not_started_series])
         
         # Additional categories
-        recently_watched = []
-        if hasattr(self, '_last_updated') and self._last_updated:
-            # Could be enhanced to track actual watch dates if available
-            recently_watched = [s['title'] for s in watched_series][:10]  # Top 10 as placeholder
-        
         # Series by episode count ranges
         episode_ranges = {
             "short_series": [s['title'] for s in series_progress if s['total_episodes'] <= 5],
@@ -619,10 +574,7 @@ class IndexManager:
         return report
         
     def get_series_with_progress(self, sort_by='completion', reverse=False):
-        """
-        Get series with episode progress information
-        Returns a list of dicts, each with keys: title, watched_episodes, total_episodes, is_incomplete, completion, etc.
-        """
+        """Return series list with episode progress and completion percentages."""
         series_list = []
         for s in self.series_index.values():
             total_eps = 0

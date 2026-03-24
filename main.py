@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
 """
-BS.TO Series Scraper and Index Manager
-Automatically scrapes your watched TV series from bs.to and maintains a local index
+BS.TO Series Scraper & Index Manager
+
+Scrapes watched TV series from bs.to and maintains a local JSON index.
+Supports sequential/parallel scraping, checkpoint resume, batch URL import,
+and interactive change confirmation before saving.
 """
 
 import json
-import sys
-import os
 import logging
+import os
 import re
 import subprocess
+import sys
 from urllib.parse import urlparse
 
-# Pre-compiled regex for URL validation
-_SERIE_URL_RE = re.compile(r'/serie/[^/]+')
+from config.config import USERNAME, PASSWORD, DATA_DIR, LOG_FILE
+from src.scraper import BsToScraper
+from src.index_manager import IndexManager, confirm_and_save_changes
 
-# Configure logging
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('scraper.log'),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
-
 logger = logging.getLogger(__name__)
 
-from config.config import SERIES_INDEX_FILE, USERNAME, PASSWORD, DATA_DIR
-from src.scraper import BsToScraper
-from src.index_manager import IndexManager, confirm_and_save_changes
+_SERIE_URL_RE = re.compile(r'/serie/[^/]+')
 
-# Human-readable labels for each checkpoint mode
 _MODE_LABELS = {
     'all_series': 'Scrape all series',
     'new_only': 'Scrape new series only',
@@ -42,14 +42,13 @@ _MODE_LABELS = {
 
 
 def print_header():
-    """Print application header"""
     print("\n" + "="*60)
     print("  BS.TO SERIES SCRAPER & INDEX MANAGER")
     print("="*60 + "\n")
 
 
 def print_scraped_series_status():
-    """Reload index and print status for all newly scraped/updated series"""
+    """Print episode counts for the most recently updated series."""
     try:
         index_manager = IndexManager()
         
@@ -86,7 +85,6 @@ def print_scraped_series_status():
 
 
 def validate_credentials():
-    """Validate that credentials are configured"""
     if not USERNAME or not PASSWORD:
         print("✗ ERROR: Credentials not configured!")
         print("\nPlease follow these steps:")
@@ -98,7 +96,6 @@ def validate_credentials():
 
 
 def show_menu():
-    """Display interactive menu"""
     print("\nOptions:")
     print("  1. Scrape series from bs.to (requires login)")
     print("  2. Scrape only NEW series (faster)")
@@ -112,11 +109,9 @@ def show_menu():
 
 
 def _check_checkpoint(expected_mode):
-    """Check if a checkpoint exists and whether it matches the expected mode.
+    """Check for an existing checkpoint and prompt the user to resume or discard.
 
-    Returns True if we should proceed (no checkpoint, or user chose to resume/discard).
-    Returns False if the user cancelled.
-    Sets the returned dict's 'resume' key when the user wants to resume.
+    Returns dict with 'ok' (proceed?) and 'resume' (resume from checkpoint?).
     """
     saved_mode = BsToScraper.get_checkpoint_mode(DATA_DIR)
     if saved_mode is None:
@@ -149,14 +144,10 @@ def _check_checkpoint(expected_mode):
 
 
 def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
-    """Common pattern: create scraper, run, confirm & save, handle errors.
-    
-    Returns the scraper instance (or None on error) so callers can inspect
-    failed_links or series_data if needed.
-    """
+    """Create scraper, run, confirm & save. Returns the scraper or None on error."""
     try:
         scraper = BsToScraper()
-        scraper.run(SERIES_INDEX_FILE, **run_kwargs)
+        scraper.run(**run_kwargs)
 
         if scraper.series_data:
             if confirm_and_save_changes(scraper.series_data, description):
@@ -185,7 +176,6 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
 
 
 def scrape_series():
-    """Execute series scraping with optional resume from checkpoint"""
     print("\n→ Starting BS.TO scraper...")
     print("  (Browser will open - do not close it manually)\n")
 
@@ -196,7 +186,6 @@ def scrape_series():
         return
     resume = chk['resume']
 
-    # Validate user input for scraping mode
     print("\nScraping mode:")
     print("  1. Sequential (slower, but most reliable)")
     print("  2. Parallel (faster, uses multiple workers)\n")
@@ -217,7 +206,6 @@ def scrape_series():
 
 
 def scrape_new_series():
-    """Execute scraping only for new series not yet in the index"""
     print("\n→ Starting BS.TO scraper (NEW series only)...")
     print("  (Browser will open - do not close it manually)\n")
 
@@ -234,77 +222,7 @@ def scrape_new_series():
     )
 
 
-def generate_report():
-    """Generate and save full report"""
-    manager = IndexManager()
-    report = manager.get_full_report()
-    
-    report_file = os.path.join(os.path.dirname(__file__), 'data', 'series_report.json')
-    
-    try:
-        with open(report_file, 'w', encoding='utf-8') as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-        print(f"\n✓ Report saved to: {report_file}")
-        
-        # Display summary
-        meta = report['metadata']
-        stats = meta['statistics']
-        print(f"\n  Total series:       {stats['total_series']}")
-        print(f"  Watched (100%):     {stats['watched']}")
-        
-        ongoing_count = report['categories']['ongoing']['count']
-        not_started_count = report['categories']['not_started']['count']
-        print(f"  Ongoing (started):  {ongoing_count}")
-        print(f"  Not started:        {not_started_count}")
-        print(f"  Generated:          {meta['generated']}")
-        
-        # Show ongoing series (started but incomplete)
-        if ongoing_count > 0:
-            print(f"\n📺 ONGOING SERIES ({ongoing_count}):")
-            ongoing_titles = report['categories']['ongoing']['titles']
-            for title in ongoing_titles[:10]:
-                print(f"  • {title}")
-            if ongoing_count > 10:
-                print(f"  ... and {ongoing_count - 10} more\n")
-            
-            # Offer to export ongoing series URLs to series_urls.txt
-            export = input(f"\nExport {ongoing_count} ongoing series URLs to series_urls.txt? (y/n): ").strip().lower()
-            if export == 'y':
-                try:
-                    # Get URLs for ongoing series from the index
-                    urls = []
-                    ongoing_titles = report['categories']['ongoing']['titles']
-                    for title in ongoing_titles:
-                        series_data = manager.series_index.get(title, {})
-                        url = series_data.get('url') or series_data.get('link')
-                        if url:
-                            # Ensure full URL
-                            if not url.startswith('http'):
-                                url = f"https://bs.to{url}"
-                            urls.append(url)
-                    
-                    if urls:
-                        # Write to series_urls.txt
-                        urls_file = os.path.join(os.path.dirname(__file__), 'series_urls.txt')
-                        with open(urls_file, 'w', encoding='utf-8') as f:
-                            f.write('\n'.join(urls) + '\n')
-                        print(f"\n✓ Exported {len(urls)} URLs to series_urls.txt")
-                        print(f"  → Use option 6 (Batch add) to rescrape these series")
-                        logger.info(f"Exported {len(urls)} URLs to series_urls.txt")
-                    else:
-                        print("\n⚠ Could not extract URLs from ongoing series")
-                        logger.warning("Could not extract URLs from ongoing series for export")
-                except Exception as e:
-                    print(f"\n✗ Failed to export URLs: {str(e)}")
-                    logger.error(f"Failed to export URLs: {e}")
-        
-    except Exception as e:
-        print(f"\n✗ Failed to generate report: {str(e)}")
-        logger.error(f"Failed to generate report: {e}")
-
-
 def add_series_by_url():
-    """Add a single series to the index by pasting its URL"""
     print("\n→ Add single series by URL")
     print("  Example: https://bs.to/serie/Breaking-Bad\n")
     
@@ -342,13 +260,12 @@ def add_series_by_url():
         no_data_msg=f"No data scraped for URL: {url}",
     )
 
-    # Show episode status for the scraped series
     if scraper and scraper.series_data:
         _print_single_series_status(scraper.series_data, url)
 
 
 def _print_single_series_status(series_data, url):
-    """Print watched/total status for a single scraped series."""
+    """Print watched/total episode counts for one series."""
     # Find the series in scraped data
     series = None
     if isinstance(series_data, list):
@@ -379,8 +296,75 @@ def _print_single_series_status(series_data, url):
     print(f"\nStatus for '{source.get('title', url)}': {watched}/{total} episodes watched ({percent}%)")
 
 
+def generate_report():
+    manager = IndexManager()
+    report = manager.get_full_report()
+    
+    report_file = os.path.join(DATA_DIR, 'series_report.json')
+    
+    try:
+        with open(report_file, 'w', encoding='utf-8') as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f"\n✓ Report saved to: {report_file}")
+        
+        # Display summary
+        meta = report['metadata']
+        stats = meta['statistics']
+        print(f"\n  Total series:       {stats['total_series']}")
+        print(f"  Watched (100%):     {stats['watched']}")
+        
+        ongoing_count = report['categories']['ongoing']['count']
+        not_started_count = report['categories']['not_started']['count']
+        print(f"  Ongoing (started):  {ongoing_count}")
+        print(f"  Not started:        {not_started_count}")
+        print(f"  Generated:          {meta['generated']}")
+        
+        # Show ongoing series (started but incomplete)
+        if ongoing_count > 0:
+            print(f"\n📺 ONGOING SERIES ({ongoing_count}):")
+            ongoing_titles = report['categories']['ongoing']['titles']
+            for title in ongoing_titles[:10]:
+                print(f"  • {title}")
+            if ongoing_count > 10:
+                print(f"  ... and {ongoing_count - 10} more\n")
+            
+            # Offer to export ongoing series URLs to series_urls.txt
+            export = input(f"\nExport {ongoing_count} ongoing series URLs to series_urls.txt? (y/n): ").strip().lower()
+            if export == 'y':
+                try:
+                    # Get URLs for ongoing series
+                    urls = []
+                    ongoing_titles = report['categories']['ongoing']['titles']
+                    for title in ongoing_titles:
+                        series_data = manager.series_index.get(title, {})
+                        url = series_data.get('url') or series_data.get('link')
+                        if url:
+                            # Full URL if needed
+                            if not url.startswith('http'):
+                                url = f"https://bs.to{url}"
+                            urls.append(url)
+                    
+                    if urls:
+                        # Write to series_urls.txt
+                        urls_file = os.path.join(os.path.dirname(__file__), 'series_urls.txt')
+                        with open(urls_file, 'w', encoding='utf-8') as f:
+                            f.write('\n'.join(urls) + '\n')
+                        print(f"\n✓ Exported {len(urls)} URLs to series_urls.txt")
+                        print(f"  → Use option 6 (Batch add) to rescrape these series")
+                        logger.info(f"Exported {len(urls)} URLs to series_urls.txt")
+                    else:
+                        print("\n⚠ Could not extract URLs from ongoing series")
+                        logger.warning("Could not extract URLs from ongoing series for export")
+                except Exception as e:
+                    print(f"\n✗ Failed to export URLs: {str(e)}")
+                    logger.error(f"Failed to export URLs: {e}")
+        
+    except Exception as e:
+        print(f"\n✗ Failed to generate report: {str(e)}")
+        logger.error(f"Failed to generate report: {e}")
+
+
 def batch_add_series_from_file():
-    """Add multiple series from a text file containing URLs (one per line)"""
     print("\n→ Batch add series from text file")
     print("  The file should contain one URL per line")
     print("  Example format:")
@@ -435,11 +419,9 @@ def batch_add_series_from_file():
     )
 
 def retry_failed_series():
-    """Retry previously failed series"""
     print("\n→ Retry failed series from last run")
     print("  (Browser will open - do not close it manually)\n")
 
-    # Pre-check for failed series before launching browser
     temp_scraper = BsToScraper()
     failed_list = temp_scraper.load_failed_series()
     if not failed_list:
@@ -462,7 +444,6 @@ def retry_failed_series():
 
 
 def pause_scraping():
-    """Create a pause file to signal workers to pause scraping"""
     pause_file = os.path.join(DATA_DIR, '.pause_scraping')
     try:
         with open(pause_file, 'w', encoding='utf-8') as f:
@@ -474,7 +455,6 @@ def pause_scraping():
         logger.error(f"Failed to create pause file {pause_file}: {e}")
 
 def show_active_workers():
-    """Display active worker processes"""
     worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
     
     if not os.path.exists(worker_pids_file):
@@ -499,7 +479,6 @@ def show_active_workers():
             logger.error(f"Error parsing worker PIDs: {e}")
             return
         print()
-        # Option to kill all workers
         kill_choice = input("Kill all workers? (y/n): ").strip().lower()
         if kill_choice == 'y':
             print("\n🔴 Killing all workers...")
@@ -531,10 +510,7 @@ def show_active_workers():
 
 
 def main():
-    """Main application loop"""
     print_header()
-    
-    # Validate credentials
     if not validate_credentials():
         sys.exit(1)
         

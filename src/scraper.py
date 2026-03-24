@@ -1,6 +1,9 @@
 """
-BS.TO Series Scraper v2 - Config-based, clean implementation
-Automatically scrapes watched TV series from bs.to with configurable selectors
+BS.TO Series Scraper
+
+Config-driven scraper using Selenium + BeautifulSoup.
+Supports sequential and parallel (ThreadPoolExecutor) modes,
+checkpoints, retry, and atomic JSON writes.
 """
 
 import atexit
@@ -26,12 +29,10 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service as FirefoxService
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
 
-# Performance settings
-# Allow overriding worker count via environment variable BS_MAX_WORKERS
-MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))  # Default to 16 workers for parallel scraping
+# Worker pool size — override via BS_MAX_WORKERS env var
+MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))
 USE_PARALLEL = True
 
 
@@ -39,22 +40,19 @@ USE_PARALLEL = True
 _SEASON_LABEL_RE = re.compile(r'^(staffel|season|s)?\s*\d+$', re.IGNORECASE)
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 _DOMAIN_STRIP_RE = re.compile(r'^https?://[^/]+')
+
+# Navigation/utility pages to filter out from series listings
+_UTILITY_PAGES = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
 _SERIE_PATH_RE = re.compile(r'(/serie/[^/]+)')
 
 
 def is_regular_season(season_label):
-    """
-    Check if season label is a regular numbered season (Staffel 1, Season 2, etc.)
-    vs special content (Specials, OVA, Movies, Filme, etc.)
-    
-    Returns True for regular seasons that can use the 'assume unwatched' optimization.
-    Returns False for special seasons that should always be checked individually.
-    """
+    """True for numbered seasons (Staffel 1, Season 2, S3, etc.), False for specials."""
     return bool(_SEASON_LABEL_RE.search(season_label.strip()))
 
 
 def cleanup_geckodriver_processes():
-    """Clean up only the geckodriver processes we spawned (safe for personal Firefox)"""
+    """Kill geckodriver processes we spawned (tracked by PID file)."""
     try:
         # Load tracked worker PIDs
         worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
@@ -96,26 +94,6 @@ signal.signal(signal.SIGTERM, _signal_handler)
 class BsToScraper:
     """Config-based web scraper for BS.TO series"""
     
-    def normalize_to_series_url(self, url):
-        # Handles URLs like:
-        #   https://bs.to/serie/Series-Name
-        #   https://bs.to/serie/Series-Name/1/de
-        #   https://bs.to/serie/Series-Name/1/1/de
-        #   /serie/Series-Name/1/de
-        #   /serie/Series-Name/1/1/de
-        # Remove protocol and domain if present
-        url = _DOMAIN_STRIP_RE.sub("", url)
-        # Find the /serie/Series-Name part
-        m = _SERIE_PATH_RE.match(url)
-        if m:
-            main_path = m.group(1)
-        else:
-            # fallback: if not matching, return as is
-            return url
-        # Always return full URL
-        site_url = self.get_site_url().rstrip("/")
-        return f"{site_url}{main_path}"
-    
     def __init__(self):
         self.driver = None
         self.series_data = []
@@ -128,8 +106,8 @@ class BsToScraper:
         self.completed_links = set()
         self.failed_links = []
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
-        self._worker_lock = threading.Lock()  # Protects worker_pids dict/file writes
-        self._checkpoint_mode = None  # Track which menu option created the checkpoint
+        self._worker_lock = threading.Lock()
+        self._checkpoint_mode = None
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
@@ -138,11 +116,7 @@ class BsToScraper:
     
     @staticmethod
     def _atomic_write_json(filepath, data):
-        """Write JSON to file atomically via temp file + os.replace.
-        
-        Prevents corrupted files if the process is killed mid-write.
-        os.replace is atomic on both Windows and POSIX.
-        """
+        """Write JSON atomically via temp file + os.replace."""
         dirpath = os.path.dirname(filepath)
         os.makedirs(dirpath, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix='.tmp')
@@ -160,7 +134,7 @@ class BsToScraper:
     # ==================== CONFIG HELPERS ====================
     
     def get_selector(self, path):
-        """Get selector from config using dot notation (e.g., 'login.username_field')"""
+        """Get selector from config using dot notation (e.g. 'login.username_field')."""
         keys = path.split('.')
         value = self.config.get('selectors', {})
         for key in keys:
@@ -171,18 +145,13 @@ class BsToScraper:
         return value
     
     def get_timing(self, key):
-        """Get timing delay from config"""
         return self.config.get('timing', {}).get(key, 0.3)
     
     def get_site_url(self):
-        """Get site URL from config"""
         return self.config.get('site_url', 'https://bs.to')
     
     def is_logged_in(self, driver):
-        """Check if driver is logged in by looking for verification markers.
-        
-        Returns True if logged in, False otherwise.
-        """
+        """Check if driver session is authenticated by looking for known markers."""
         try:
             page_html = driver.page_source.lower()
             login_config = self.get_selector('login')
@@ -193,11 +162,21 @@ class BsToScraper:
             return False
     
     def get_login_page(self):
-        """Get login page URL from config"""
         return self.config.get('login_page', 'https://bs.to/login')
     
+    def normalize_to_series_url(self, url):
+        """Normalize any bs.to series URL to its canonical form (e.g. https://bs.to/serie/Name)."""
+        url = _DOMAIN_STRIP_RE.sub("", url)
+        m = _SERIE_PATH_RE.match(url)
+        if m:
+            main_path = m.group(1)
+        else:
+            return url
+        site_url = self.get_site_url().rstrip("/")
+        return f"{site_url}{main_path}"
+    
     def parse_season_item(self, season_item):
-        """Parse season item tuple into components, handling different tuple lengths"""
+        """Unpack a season tuple into (label, url, watched_status, season_type)."""
         # Handle new format (label, url, watched_status, season_type)
         if len(season_item) == 4:
             season_label, season_url, watched_status, season_type = season_item
@@ -214,7 +193,6 @@ class BsToScraper:
     # ==================== ELEMENT FINDING ====================
     
     def convert_selector_to_by(self, selector_type):
-        """Convert config selector type to Selenium By"""
         by_map = {
             'id': By.ID,
             'name': By.NAME,
@@ -226,7 +204,7 @@ class BsToScraper:
         return by_map.get(selector_type, By.CSS_SELECTOR)
     
     def find_element_from_config(self, driver, config_selectors, timeout=2):
-        """Try to find element using list of selectors from config"""
+        """Try each selector from config until one matches."""
         if not isinstance(config_selectors, list):
             config_selectors = [config_selectors]
         
@@ -247,15 +225,7 @@ class BsToScraper:
         return None
     
     def wait_for_element(self, driver, selector_by, selector_value, timeout=None, silent=False):
-        """Wait for element to be present and visible
-        
-        Args:
-            driver: Selenium WebDriver instance
-            selector_by: Selenium By selector type
-            selector_value: Selector value to find
-            timeout: Timeout in seconds (default from config)
-            silent: If True, don't print error messages on timeout
-        """
+        """Wait for element to be present. Returns True on success, False on timeout."""
         if timeout is None:
             # Increase default timeout to 20 seconds for more reliability
             timeout = self.get_timing('timeout') or 20
@@ -270,16 +240,12 @@ class BsToScraper:
             return False
     
     def wait_for_css_element(self, driver, css_selector, timeout=None, silent=False):
-        """Wait for CSS selector element to be present"""
         return self.wait_for_element(driver, By.CSS_SELECTOR, css_selector, timeout, silent)
     
     # ==================== CHECKPOINT SYSTEM ====================
     
     def save_checkpoint(self):
-        """Save scraping checkpoint to resume later (as dict with 'completed_links')
-        
-        Uses atomic write to prevent corruption if process is killed mid-write.
-        """
+        """Save completed-links checkpoint for resume (atomic write)."""
         try:
             checkpoint_data = {
                 'completed_links': list(self.completed_links),
@@ -290,7 +256,7 @@ class BsToScraper:
             pass
     
     def load_checkpoint(self):
-        """Load checkpoint to resume from previous run (expects dict with 'completed_links')"""
+        """Load checkpoint from a previous run. Returns True if loaded."""
         if not os.path.exists(self.checkpoint_file):
             return False
         try:
@@ -312,7 +278,6 @@ class BsToScraper:
             return False
     
     def clear_checkpoint(self):
-        """Clear checkpoint after successful completion"""
         try:
             if os.path.exists(self.checkpoint_file):
                 os.remove(self.checkpoint_file)
@@ -333,10 +298,7 @@ class BsToScraper:
             return None
     
     def save_failed_series(self):
-        """Save failed series links for later retry.
-        
-        Uses atomic write to prevent corruption if process is killed mid-write.
-        """
+        """Persist failed series links for later retry (atomic write)."""
         if not self.failed_links:
             return
         try:
@@ -345,7 +307,6 @@ class BsToScraper:
             pass
     
     def load_failed_series(self):
-        """Load previously failed series for retry"""
         try:
             if os.path.exists(self.failed_file):
                 with open(self.failed_file, 'r', encoding='utf-8') as f:
@@ -356,7 +317,6 @@ class BsToScraper:
         return []
     
     def clear_failed_series(self):
-        """Clear failed series list after successful retry"""
         try:
             if os.path.exists(self.failed_file):
                 os.remove(self.failed_file)
@@ -364,11 +324,9 @@ class BsToScraper:
             pass
     
     def is_pause_requested(self):
-        """Check if pause has been requested via pause file"""
         return os.path.exists(self.pause_file)
     
     def clear_pause_request(self):
-        """Clear pause request file"""
         try:
             if os.path.exists(self.pause_file):
                 os.remove(self.pause_file)
@@ -376,7 +334,7 @@ class BsToScraper:
             pass
     
     def save_worker_pid(self, worker_id, pid):
-        """Track a worker's geckodriver PID (thread-safe, atomic write)"""
+        """Track a worker's geckodriver PID (thread-safe, atomic)."""
         with self._worker_lock:
             self.worker_pids[str(worker_id)] = pid
             try:
@@ -385,7 +343,6 @@ class BsToScraper:
                 pass
     
     def clear_worker_pids(self):
-        """Clear tracked worker PIDs after scraping (thread-safe)"""
         with self._worker_lock:
             self.worker_pids = {}
             try:
@@ -397,13 +354,12 @@ class BsToScraper:
     # ==================== DRIVER SETUP ====================
     
     def _build_firefox_options(self):
-        """Build shared Firefox options for both main and worker drivers"""
+        """Build shared Firefox options for main and worker drivers."""
         firefox_options = Options()
         if HEADLESS:
             firefox_options.add_argument("--headless")
         firefox_options.add_argument("--disable-gpu")
         firefox_options.add_argument('--disable-blink-features=AutomationControlled')
-        # Performance/stealth preferences
         firefox_options.set_preference("permissions.default.image", 1)
         firefox_options.set_preference("media.autoplay.default", 1)
         firefox_options.set_preference("dom.ipc.processPrelaunch.enabled", False)
@@ -415,19 +371,18 @@ class BsToScraper:
         return firefox_options
     
     def _build_firefox_service(self):
-        """Build Firefox service, using local geckodriver if available"""
+        """Build Firefox service, preferring local geckodriver if available."""
         gecko_path = os.path.join(os.path.dirname(__file__), '..', 'geckodriver.exe')
         if os.path.exists(gecko_path):
             return FirefoxService(gecko_path)
         return FirefoxService()
     
     def setup_driver(self):
-        """Initialize the Selenium WebDriver"""
         firefox_options = self._build_firefox_options()
         firefox_service = self._build_firefox_service()
         self.driver = webdriver.Firefox(service=firefox_service, options=firefox_options)
         
-        # Track main driver PID for sequential mode (option 9)
+        # Track main driver PID for worker management
         try:
             if hasattr(firefox_service, 'process') and firefox_service.process:
                 self.save_worker_pid(0, firefox_service.process.pid)  # worker_id=0 for main driver
@@ -435,7 +390,6 @@ class BsToScraper:
             pass
     
     def close(self):
-        """Close the browser and clean up Firefox processes"""
         if self.driver:
             try:
                 self.driver.quit()
@@ -446,11 +400,7 @@ class BsToScraper:
     # ==================== AUTHENTICATION ====================
     
     def login(self, driver=None):
-        """Login to bs.to using config-based selectors.
-        
-        Args:
-            driver: WebDriver instance to use. Defaults to self.driver.
-        """
+        """Login to bs.to using config-based selectors."""
         drv = driver or self.driver
         try:
             login_config = self.get_selector('login')
@@ -499,7 +449,7 @@ class BsToScraper:
             else:
                 password_field.send_keys("\n")
 
-            # Wait for redirect or page load
+            # Wait for redirect
             try:
                 WebDriverWait(drv, TIMEOUT).until(
                     lambda d: d.current_url != login_page
@@ -507,13 +457,10 @@ class BsToScraper:
             except Exception:
                 pass
 
-            # Wait for body to fully load
             self.wait_for_css_element(drv, "body", timeout=3)
-            
-            # Additional delay after login for page stabilization
             time.sleep(self.get_timing('login_delay'))
             
-            # Verify login with markers from config
+            # Verify login
             if self.is_logged_in(drv):
                 if drv is self.driver:
                     print("✓ Login completed")
@@ -533,7 +480,7 @@ class BsToScraper:
     # ==================== SERIES DISCOVERY ====================
     
     def get_all_series(self):
-        """Get list of all series from andere-serien page"""
+        """Fetch the full series list from the andere-serien page."""
         try:
             print("→ Fetching list of all series...")
             
@@ -576,15 +523,14 @@ class BsToScraper:
                         })
             
             # Remove duplicates while preserving order
-            utility_pages = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
             seen = set()
             unique_series = []
             for s in series_list:
                 # Skip utility/navigation pages (case-insensitive, strip whitespace)
                 title_normalized = s['title'].lower().strip()
                 # Also check if title contains utility keywords
-                is_utility = (title_normalized in utility_pages or 
-                             any(keyword in title_normalized for keyword in utility_pages))
+                is_utility = (title_normalized in _UTILITY_PAGES or 
+                             any(keyword in title_normalized for keyword in _UTILITY_PAGES))
                 if is_utility:
                     continue
                 if s['link'] not in seen:
@@ -601,11 +547,9 @@ class BsToScraper:
     # ==================== SEASON SCRAPING ====================
     
     def get_season_links(self, html, base_url):
-        """Extract season links from season selector (includes specials/season 0)
-        
-        Returns list of tuples: (label, href, watched_status, season_type)
-        watched_status: 'full' = all watched (green), 'none' = unwatched (grey)
-        season_type: 'regular' for numbered seasons, or the special label (e.g., 'OVA', 'Special', 'Movie', etc.)
+        """Extract season links with watched status from the series page.
+
+        Returns list of (label, url, watched_status, season_type) tuples.
         """
         soup = BeautifulSoup(html, 'html.parser')
         season_links = []
@@ -669,7 +613,7 @@ class BsToScraper:
 
             season_links.append((label, season_url, watched_status, season_type_val))
 
-        # Deduplicate while preserving order
+        # Deduplicate seasons while preserving order
         seen = set()
         unique = []
         for entry in season_links:
@@ -683,7 +627,7 @@ class BsToScraper:
     # ==================== EPISODE SCRAPING ====================
     
     def scrape_episodes_from_html(self, html):
-        """Parse episodes table and detect watched status"""
+        """Parse episodes table and return list of {number, title, watched}."""
         soup = BeautifulSoup(html, 'html.parser')
         episodes = []
         
@@ -743,10 +687,7 @@ class BsToScraper:
     # ==================== SERIES PROCESSING ====================
     
     def check_series_not_found_error(self, html):
-        """
-        Check if page contains German error message for series not found
-        Returns error message if found, None otherwise
-        """
+        """Return the German error text if the page says 'Serie nicht gefunden'."""
         soup = BeautifulSoup(html, 'html.parser')
         error_div = soup.find('div', class_='messageBox error')
         if error_div:
@@ -756,25 +697,52 @@ class BsToScraper:
         return None
     
     def process_series_page(self, url, series_hint=None):
-        """Navigate to series page using the main driver. Thin wrapper around _process_series."""
+        """Scrape a series using the main driver."""
         return self._process_series(self.driver, url, series_hint=series_hint)
     
-    def _process_series(self, driver, url, series_hint=None):
-        """Core method: navigate to a series page, extract title and all seasons/episodes.
+    def extract_series_title(self, html):
+        """Extract series title from HTML using config selectors."""
+        soup = BeautifulSoup(html, 'html.parser')
         
-        Used by both sequential (self.driver) and parallel (worker driver) modes.
-        All scraping logic lives here — no duplicates.
+        series_config = self.get_selector('series_page')
+        if not series_config:
+            return None
+        
+        title_config = series_config.get('title', {})
+        title_type = title_config.get('type', 'tag')
+        title_value = title_config.get('value', 'h2')
+        
+        try:
+            if title_type == 'tag':
+                element = soup.find(title_value)
+            else:
+                element = soup.select_one(title_value)
+            
+            if element:
+                main_text = element.get_text(strip=True)
+                if element.small:
+                    small_text = element.small.get_text(strip=True)
+                    main_text = main_text.replace(small_text, "").strip()
+                
+                return main_text if main_text else None
+        except Exception:
+            pass
+        
+        return None
+    
+    def _process_series(self, driver, url, series_hint=None):
+        """Core scraping: navigate to a series page, extract title, seasons, and episodes.
+
+        Used by both sequential (self.driver) and parallel (worker) modes.
         """
         try:
             driver.get(url)
-            # Wait for the body to be present and visible (ensures page is loaded)
             self.wait_for_css_element(driver, "body", timeout=10)
-            # Wait for title to appear (series title) - silent since not all pages have h2
             self.wait_for_css_element(driver, "h2", timeout=10, silent=True)
 
             page_content = driver.page_source
 
-            # Detect browser navigation / network error pages (about:neterror etc.)
+            # Detect browser error pages
             try:
                 current_url = driver.current_url or ''
             except Exception:
@@ -784,7 +752,7 @@ class BsToScraper:
             if page_content and ('Die Verbindung mit dem Server' in page_content or 'dnsNotFound' in page_content):
                 raise Exception(f"Reached error page content for: {url}")
 
-            # Check for German error message "Serie nicht gefunden" (Series not found)
+            # Check for "Serie nicht gefunden" error page
             error_found = self.check_series_not_found_error(page_content)
             if error_found:
                 print(f"✗ Series not found: {url} - {error_found}")
@@ -802,10 +770,10 @@ class BsToScraper:
             title_info = self.extract_series_title(page_content)
             title_value = title_info if title_info else None
 
-            # Skip utility/navigation pages that somehow got through filtering
+            # Skip utility pages
             if title_value:
                 title_normalized = title_value.lower().strip()
-                utility_pages = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
+                utility_pages = _UTILITY_PAGES
                 if title_normalized in utility_pages or any(keyword in title_normalized for keyword in utility_pages):
                     print(f"⚠ Skipping utility page: '{title_value}' (URL: {url})")
                     return {
@@ -816,10 +784,9 @@ class BsToScraper:
                         'seasons': []
                     }
 
-            # Get season links (including specials) with watched status
             season_links = self.get_season_links(page_content, url)
             if not season_links:
-                season_links = [("1", url, "none")]  # Default: needs loading
+                season_links = [("1", url, "none")]
 
             seasons_data = []
             total_watched = 0
@@ -897,43 +864,12 @@ class BsToScraper:
         except Exception as e:
             raise Exception(f"Series processing failed for {url}: {str(e)}")
     
-    def extract_series_title(self, html):
-        """Extract series title from HTML using config selectors (no approval prompts)"""
-        soup = BeautifulSoup(html, 'html.parser')
-        
-        series_config = self.get_selector('series_page')
-        if not series_config:
-            return None
-        
-        title_config = series_config.get('title', {})
-        title_type = title_config.get('type', 'tag')
-        title_value = title_config.get('value', 'h2')
-        
-        try:
-            if title_type == 'tag':
-                element = soup.find(title_value)
-            else:
-                element = soup.select_one(title_value)
-            
-            if element:
-                # Extract main text, optionally removing small tags
-                main_text = element.get_text(strip=True)
-                if element.small:
-                    small_text = element.small.get_text(strip=True)
-                    main_text = main_text.replace(small_text, "").strip()
-                
-                return main_text if main_text else None
-        except Exception:
-            pass
-        
-        return None
-    
     # ==================== SCRAPING MODES ====================
     
     def scrape_series_list(self):
-        """Scrape all TV series"""
+        """Scrape all series in sequential or parallel mode."""
         try:
-            # Initial delay before starting scraping
+            # Initial delay
             time.sleep(self.get_timing('initial_delay'))
             
             all_series = self.get_all_series()
@@ -952,17 +888,24 @@ class BsToScraper:
             print(f"✗ Series scraping failed: {str(e)}")
             raise
     
+    def _filter_completed(self, all_series):
+        """Remove checkpoint-completed series. Returns filtered list or None if all done."""
+        if not self.completed_links:
+            return all_series
+        before = len(all_series)
+        filtered = [s for s in all_series if s.get('link') not in self.completed_links]
+        if before != len(filtered):
+            print(f"  Skipping {before - len(filtered)} already-completed series")
+        if not filtered:
+            print("✓ All series already scraped (from checkpoint)")
+            return None
+        return filtered
+
     def _scrape_series_sequential(self, all_series):
-        """Sequential scraping with progress bar and ETA"""
-        # Filter out already-completed series (from checkpoint resume)
-        if self.completed_links:
-            before = len(all_series)
-            all_series = [s for s in all_series if s.get('link') not in self.completed_links]
-            if before != len(all_series):
-                print(f"  Skipping {before - len(all_series)} already-completed series")
-            if not all_series:
-                print("✓ All series already scraped (from checkpoint)")
-                return
+        """Sequential scraping with progress bar and ETA."""
+        all_series = self._filter_completed(all_series)
+        if all_series is None:
+            return
         start_time = time.time()
         try:
             for idx, series in enumerate(all_series, 1):
@@ -1019,19 +962,13 @@ class BsToScraper:
         print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
     
     def _scrape_series_parallel(self, all_series, worker_cap=None):
-        """Parallel scraping with pre-partitioned work pools. Each worker gets its own dedicated list."""
-        # Clear any leftover pause file from previous runs
+        """Parallel scraping with shared work queue and per-worker Firefox instances."""
+        # Clear leftover pause file
         self.clear_pause_request()
         
-        # Filter out already-completed series (from checkpoint resume)
-        if self.completed_links:
-            before = len(all_series)
-            all_series = [s for s in all_series if s.get('link') not in self.completed_links]
-            if before != len(all_series):
-                print(f"  Skipping {before - len(all_series)} already-completed series")
-            if not all_series:
-                print("✓ All series already scraped (from checkpoint)")
-                return
+        all_series = self._filter_completed(all_series)
+        if all_series is None:
+            return
 
         self.series_data = []
         start_time = time.time()
@@ -1041,14 +978,13 @@ class BsToScraper:
         stop_event = threading.Event()
 
         # Filter utility pages (case-insensitive)
-        utility_pages = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
-        filtered_series = [s for s in all_series if not any(keyword in s.get('title', '').lower().strip() for keyword in utility_pages)]
+        filtered_series = [s for s in all_series if not any(keyword in s.get('title', '').lower().strip() for keyword in _UTILITY_PAGES)]
         total_series = len(filtered_series)
 
         max_workers_allowed = worker_cap if worker_cap is not None else MAX_WORKERS
         worker_count = min(max_workers_allowed, total_series) or 1
         
-        # Shared work queue — all workers pull from the same pool
+        # Shared work queue
         work_queue = queue.Queue()
         for item in filtered_series:
             work_queue.put(item)
@@ -1093,7 +1029,7 @@ class BsToScraper:
             error_streak = 0
             tasks_since_check = 0
             
-            # Share cookies from main driver login (already authenticated in run())
+            # Share auth cookies from main driver
             authenticated = False
             max_auth_retries = 3
             for attempt in range(max_auth_retries):
@@ -1126,7 +1062,7 @@ class BsToScraper:
                     pass
                 return  # Exit worker — remaining items stay in queue for other workers
 
-            # Pull work from shared queue until empty or stopped
+            # Pull work from queue until empty or stopped
             while not stop_event.is_set():
                 try:
                     series = work_queue.get_nowait()
@@ -1284,51 +1220,8 @@ class BsToScraper:
         else:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
 
-    def _retry_failed_series(self):
-        """Retry scraping failed series with more aggressive settings"""
-        if not self.failed_links:
-            return
-        
-        print(f"  → Using more aggressive retry settings for series")
-        
-        successful_retries = 0
-        still_failed = []
-        for failed_series in self.failed_links:
-            try:
-                series_title = failed_series.get('title', 'Unknown')
-                series_url = failed_series.get('url', failed_series.get('link', ''))
-                
-                print(f"  🔄 Retrying series: {series_title}...")
-                
-                # Try to scrape the series again using the main driver
-                result = self._process_series(self.driver, series_url, failed_series)
-                
-                if result and result.get('seasons'):
-                    # Success! Add to series_data
-                    self.series_data.append(result)
-                    self.completed_links.add(failed_series.get('link'))
-                    successful_retries += 1
-                    print(f"    ✓ Successfully recovered {len(result.get('seasons', []))} seasons for {series_title}")
-                else:
-                    still_failed.append(failed_series)
-                    print(f"    ✗ Could not recover {series_title}")
-                        
-            except Exception as e:
-                still_failed.append(failed_series)
-                print(f"    ✗ Unexpected error retrying {series_title}: {e}")
-                continue
-        
-        self.failed_links = still_failed
-        
-        if successful_retries > 0:
-            print(f"\n✓ Recovered {successful_retries} series from {len(self.failed_links) + successful_retries} failed attempts")
-        
-        if self.failed_links:
-            print(f"⚠ {len(self.failed_links)} series still failed. Consider manual checking or running again later.")
-            self.save_failed_series()
-    
     def _create_worker_driver(self, worker_id=None):
-        """Create a new WebDriver for worker thread and track its PID"""
+        """Create a new worker WebDriver and track its PID."""
         firefox_options = self._build_firefox_options()
         service = self._build_firefox_service()
         
@@ -1355,8 +1248,8 @@ class BsToScraper:
         return driver
     
     def _apply_cookies_to_driver(self, driver):
-        """Apply auth cookies to worker driver (thread-safe snapshot)"""
-        cookies_snapshot = list(self.auth_cookies)  # Snapshot to avoid race conditions
+        """Copy auth cookies to a worker driver (thread-safe snapshot)."""
+        cookies_snapshot = list(self.auth_cookies)
         if not cookies_snapshot:
             return False
         try:
@@ -1382,7 +1275,7 @@ class BsToScraper:
     # ==================== DATA MANAGEMENT ====================
     
     def load_existing_links(self):
-        """Load existing series links to avoid re-scraping"""
+        """Load existing series links from the index (for new-only filtering)."""
         existing = set()
         try:
             if os.path.exists(SERIES_INDEX_FILE):
@@ -1397,30 +1290,13 @@ class BsToScraper:
         return existing
     
     def scrape_new_series_only(self):
-        """Scrape only new series not in index"""
-        # Initial delay before starting scraping
+        """Scrape only series not yet in the index."""
         time.sleep(self.get_timing('initial_delay'))
         
         all_series = self.get_all_series()
         existing_links = self.load_existing_links()
-        # Also load the full index to check for 'empty' flag
-        existing_index = {}
-        try:
-            if os.path.exists(SERIES_INDEX_FILE):
-                with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                for item in data or []:
-                    if item.get('link'):
-                        existing_index[item.get('link')] = item
-        except Exception:
-            pass
 
-        def is_already_in_index(s):
-            link = s.get('link')
-            entry = existing_index.get(link)
-            return link in existing_links or (entry is not None and (entry.get('empty') or entry.get('total_episodes', 0) == 0))
-
-        new_series_list = [s for s in all_series if not is_already_in_index(s)]
+        new_series_list = [s for s in all_series if s.get('link') not in existing_links]
 
         print(f"→ New series to scrape: {len(new_series_list)} (out of {len(all_series)})")
         self.series_data = []
@@ -1428,39 +1304,11 @@ class BsToScraper:
             print("✓ No new series detected — skipping scraper spin-up")
             return
 
-        # Run sequential to avoid extra workers for the small delta set
+        # Run sequential for small delta set
         self._scrape_series_sequential(new_series_list)
     
-    def scrape_resume_checkpoint(self):
-        """Resume from checkpoint"""
-        if not self.load_checkpoint():
-            print("⚠ No checkpoint found. Starting fresh...")
-            self.scrape_series_list()
-            return
-        
-        # Initial delay before resuming scraping
-        time.sleep(self.get_timing('initial_delay'))
-        
-        all_series = self.get_all_series()
-        remaining_series = [s for s in all_series if s.get('link') not in self.completed_links]
-        
-        completed_count = len(all_series) - len(remaining_series)
-        print(f"✓ Resuming from checkpoint: {completed_count}/{len(all_series)} already done")
-        print(f"→ Remaining to scrape: {len(remaining_series)}")
-        
-        self.series_data = []
-        if not remaining_series:
-            print("✓ All series already scraped")
-            return
-
-        if self._use_parallel:
-            # Resume can use full pool; series count will bound actual worker usage
-            self._scrape_series_parallel(remaining_series)
-        else:
-            self._scrape_series_sequential(remaining_series)
-    
-    def scrape_retry_failed(self, output_file):
-        # Retry previously failed series (sequential mode for reliability)
+    def scrape_retry_failed(self):
+        """Retry previously failed series in sequential mode."""
         failed_list = self.load_failed_series()
         if not failed_list:
             print("✓ No failed series found")
@@ -1470,13 +1318,11 @@ class BsToScraper:
         print("→ Starting retry in sequential mode (for reliability)...")
         self.series_data = []
     
-        # Always use sequential mode for reliability on retry
         self._scrape_series_sequential(failed_list)
     # ==================== MAIN RUN METHODS ====================
     
     def scrape_single_series(self, url):
-        """Scrape exactly one series (sequential, accurate)"""
-        # Initial delay before starting scraping
+        """Scrape exactly one series by URL."""
         time.sleep(self.get_timing('initial_delay'))
         
         main_url = self.normalize_to_series_url(url)
@@ -1486,8 +1332,7 @@ class BsToScraper:
         return result
     
     def scrape_multiple_series(self, urls):
-        """Scrape multiple series from a list of URLs (sequential, accurate)"""
-        # Initial delay before starting scraping
+        """Scrape multiple series from a URL list (sequential)."""
         time.sleep(self.get_timing('initial_delay'))
         
         print(f"→ Scraping {len(urls)} series from URL list (sequential mode)...")
@@ -1495,7 +1340,6 @@ class BsToScraper:
         series_list = []
         for url in urls:
             main_url = self.normalize_to_series_url(url)
-            # Extract path-only link (e.g. /serie/Breaking-Bad) for consistent dedup
             m = _SERIE_PATH_RE.search(main_url)
             link_path = m.group(1) if m else main_url
             series_list.append({'title': main_url.split('/')[-1], 'link': link_path, 'url': main_url})
@@ -1503,9 +1347,9 @@ class BsToScraper:
         self._scrape_series_sequential(series_list)
         print(f"  Successfully scraped: {len(self.series_data)}/{len(urls)} series")
     
-    def run(self, output_file, single_url=None, url_list=None, new_only=False, resume_only=False, retry_failed=False, parallel=None):
-        """Execute scraping workflow - collects data but does NOT save (caller handles save)"""
-        # Store parallel preference as instance attribute (thread-safe, no global mutation)
+    def run(self, single_url=None, url_list=None, new_only=False, resume_only=False, retry_failed=False, parallel=None):
+        """Main entry point: setup driver, login, run selected mode, then close."""
+        # Store parallel preference (thread-safe, no global mutation)
         if parallel is not None:
             self._use_parallel = parallel
             mode_str = "parallel" if parallel else "sequential"
@@ -1532,7 +1376,7 @@ class BsToScraper:
             elif retry_failed:
                 self._checkpoint_mode = 'retry'
                 print("→ Running in 'retry failed series' mode")
-                self.scrape_retry_failed(output_file)
+                self.scrape_retry_failed()
             elif new_only:
                 self._checkpoint_mode = 'new_only'
                 print("→ Running in 'new series only' mode")
