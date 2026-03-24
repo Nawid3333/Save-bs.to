@@ -244,19 +244,30 @@ class BsToScraper:
     
     # ==================== CHECKPOINT SYSTEM ====================
     
-    def save_checkpoint(self):
-        """Save completed-links checkpoint for resume (atomic write)."""
+    def save_checkpoint(self, include_data=False):
+        """Save completed-links checkpoint for resume (atomic write).
+        
+        Args:
+            include_data: If True, also save series_data for full state preservation.
+                          Used on exit/crash. Periodic saves use False for speed.
+        """
         try:
             checkpoint_data = {
                 'completed_links': list(self.completed_links),
                 'mode': self._checkpoint_mode,
+                'timestamp': time.time(),
             }
+            if include_data and self.series_data:
+                checkpoint_data['series_data'] = self.series_data
             self._atomic_write_json(self.checkpoint_file, checkpoint_data)
         except Exception:
             pass
     
     def load_checkpoint(self):
-        """Load checkpoint from a previous run. Returns True if loaded."""
+        """Load checkpoint from a previous run. Returns True if loaded.
+        
+        Restores completed_links, mode, and series_data (if saved).
+        """
         if not os.path.exists(self.checkpoint_file):
             return False
         try:
@@ -265,6 +276,9 @@ class BsToScraper:
             if isinstance(data, dict) and 'completed_links' in data:
                 self.completed_links = set(data.get('completed_links', []))
                 self._checkpoint_mode = data.get('mode')
+                saved_data = data.get('series_data', [])
+                if saved_data:
+                    self.series_data = saved_data
                 return True
             elif isinstance(data, list):
                 # Backward compatibility: treat as list of completed links
@@ -935,9 +949,10 @@ class BsToScraper:
                             result['empty'] = False
                             print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ✓ {result['title']}{season_info}: {result['watched_episodes']}/{result['total_episodes']} watched")
                         self.series_data.append(result)
-                        # Save checkpoint
+                        # Save checkpoint every 10 series
                         self.completed_links.add(series.get('link'))
-                        self.save_checkpoint()
+                        if idx % 10 == 0:
+                            self.save_checkpoint()
                     else:
                         print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ⚠ {series['title']}: Skipped (no data)")
                 except Exception as e:
@@ -970,7 +985,6 @@ class BsToScraper:
         if all_series is None:
             return
 
-        self.series_data = []
         start_time = time.time()
         completed = 0
         failed = 0
@@ -1391,6 +1405,13 @@ class BsToScraper:
                 self.clear_failed_series()
             else:
                 self.save_failed_series()
-            self.clear_worker_pids()
+        except BaseException:
+            # Catches Exception, SystemExit (from SIGINT), KeyboardInterrupt
+            # Save full checkpoint with series_data so no progress is lost on resume
+            self.save_checkpoint(include_data=True)
+            if self.failed_links:
+                self.save_failed_series()
+            raise
         finally:
+            self.clear_worker_pids()
             self.close()

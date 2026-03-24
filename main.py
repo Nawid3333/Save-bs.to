@@ -120,6 +120,8 @@ def _check_checkpoint(expected_mode):
     saved_label = _MODE_LABELS.get(saved_mode, saved_mode)
     expected_label = _MODE_LABELS.get(expected_mode, expected_mode)
 
+    checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
+
     if saved_mode == expected_mode:
         print(f"\n⚠ Checkpoint found from a previous \"{saved_label}\" run!\n")
         choice = input("Resume from checkpoint? (y/n): ").strip().lower()
@@ -128,8 +130,10 @@ def _check_checkpoint(expected_mode):
         # User declined resume — ask whether to discard
         discard = input("Discard old checkpoint and start fresh? (y/n): ").strip().lower()
         if discard == 'y':
-            scraper = BsToScraper()
-            scraper.clear_checkpoint()
+            try:
+                os.remove(checkpoint_file)
+            except OSError:
+                pass
             return {'ok': True, 'resume': False}
         return {'ok': False, 'resume': False}
     else:
@@ -137,8 +141,10 @@ def _check_checkpoint(expected_mode):
         print(f"   You are about to run: \"{expected_label}\"\n")
         discard = input("Discard the old checkpoint and continue? (y/n): ").strip().lower()
         if discard == 'y':
-            scraper = BsToScraper()
-            scraper.clear_checkpoint()
+            try:
+                os.remove(checkpoint_file)
+            except OSError:
+                pass
             return {'ok': True, 'resume': False}
         return {'ok': False, 'resume': False}
 
