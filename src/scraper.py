@@ -44,7 +44,6 @@ _DOMAIN_STRIP_RE = re.compile(r'^https?://[^/]+')
 # Navigation/utility pages to filter out from series listings
 _UTILITY_PAGES = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
 _SERIE_PATH_RE = re.compile(r'(/serie/[^/]+)')
-_SERIE_SLUG_RE = re.compile(r'^/serie/([^/?#]+)/?$')
 
 
 def is_regular_season(season_label):
