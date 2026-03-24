@@ -2,12 +2,33 @@ import json
 import logging
 import os
 import re
+import tempfile
 from collections import defaultdict
 from datetime import datetime
 
 from config.config import SERIES_INDEX_FILE, DATA_DIR
 
 logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(filepath, data):
+    """Write JSON to file atomically via temp file + os.replace.
+    
+    Prevents corrupted files if the process is killed mid-write.
+    """
+    dirpath = os.path.dirname(filepath)
+    os.makedirs(dirpath, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
 
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
@@ -215,8 +236,14 @@ def _load_existing_index():
             logger.error("Index file is not a valid list or dict.")
             return []
         logger.info(f"Loaded index from {SERIES_INDEX_FILE} ({len(data)} entries)")
-        return data
-    except Exception as e:
+        return data    except json.JSONDecodeError as e:
+        print(f"[ERROR] Index file corrupted: {e}")
+        logger.error(f"Index file corrupted: {e}")
+        return []
+    except OSError as e:
+        print(f"[ERROR] Cannot read index file: {e}")
+        logger.error(f"Cannot read index file: {e}")
+        return []    except Exception as e:
         print(f"\u26a0 Error loading index: {str(e)}")
         logger.error(f"Error loading index: {str(e)}")
         return []
@@ -375,8 +402,7 @@ def confirm_and_save_changes(new_data, description="data"):
 
     try:
         series_list = list(merged.values())
-        with open(SERIES_INDEX_FILE, 'w', encoding='utf-8') as f:
-            json.dump(series_list, f, indent=2, ensure_ascii=False)
+        _atomic_write_json(SERIES_INDEX_FILE, series_list)
         print(f"\u2713 Saved {len(series_list)} series to index")
         logger.info(f"Saved {len(series_list)} series to {SERIES_INDEX_FILE}")
         return True
@@ -398,33 +424,36 @@ class IndexManager:
     def load_index(self):
         """Load series index from JSON, converting both list and dict formats to dict."""
         self.series_index = {}
-        if os.path.exists(SERIES_INDEX_FILE):
-            try:
-                with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                # Handle both formats robustly
-                if isinstance(data, list):
-                    # List of series objects
-                    self.series_index = {item.get("title"): item for item in data if item.get("title")}
-                elif isinstance(data, dict):
-                    # Dict: check if it's a mapping of title->series
-                    # If values are series objects with 'title', keep as is
-                    # If not, try to convert
-                    first_item = next(iter(data.values()), None)
-                    if first_item and isinstance(first_item, dict) and first_item.get('title'):
-                        self.series_index = data
-                    else:
-                        # Unexpected dict format, try to convert
-                        self.series_index = {item.get("title"): item for item in data.values() if isinstance(item, dict) and item.get("title")}
+        if not os.path.exists(SERIES_INDEX_FILE):
+            return
+        try:
+            with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            # Handle both formats robustly
+            if isinstance(data, list):
+                self.series_index = {item.get("title"): item for item in data if item.get("title")}
+            elif isinstance(data, dict):
+                first_item = next(iter(data.values()), None)
+                if first_item and isinstance(first_item, dict) and first_item.get('title'):
+                    self.series_index = data
                 else:
-                    # Unknown format, fallback to empty
-                    self.series_index = {}
-                print(f"[OK] Loaded {len(self.series_index)} series from index")
-                logger.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
-            except Exception as e:
-                print(f"[WARN] Error loading index: {str(e)}")
-                logger.error(f"Error loading index: {str(e)}")
+                    self.series_index = {item.get("title"): item for item in data.values() if isinstance(item, dict) and item.get("title")}
+            else:
                 self.series_index = {}
+            print(f"[OK] Loaded {len(self.series_index)} series from index")
+            logger.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
+        except json.JSONDecodeError as e:
+            print(f"[ERROR] Index file corrupted: {e}")
+            logger.error(f"Index file corrupted: {e}")
+            self.series_index = {}
+        except OSError as e:
+            print(f"[ERROR] Cannot read index file: {e}")
+            logger.error(f"Cannot read index file: {e}")
+            self.series_index = {}
+        except Exception as e:
+            print(f"[WARN] Error loading index: {str(e)}")
+            logger.error(f"Error loading index: {str(e)}")
+            self.series_index = {}
 
     def get_statistics(self):
         """Return detailed analytics about the series index."""

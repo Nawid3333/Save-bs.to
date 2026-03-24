@@ -325,8 +325,9 @@ class BsToScraper:
             if include_data and self.series_data:
                 checkpoint_data['series_data'] = self.series_data
             self._atomic_write_json(self.checkpoint_file, checkpoint_data)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
+            print(f"  ⚠ Warning: checkpoint save failed: {e}")
     
     def load_checkpoint(self):
         """Load checkpoint from a previous run. Returns True if loaded.
@@ -360,8 +361,8 @@ class BsToScraper:
         try:
             if os.path.exists(self.checkpoint_file):
                 os.remove(self.checkpoint_file)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not remove checkpoint file: {e}")
 
     @staticmethod
     def get_checkpoint_mode(data_dir):
@@ -373,7 +374,8 @@ class BsToScraper:
             with open(path, 'r', encoding='utf-8') as f:
                 data = json.load(f)
             return data.get('mode') if isinstance(data, dict) else None
-        except Exception:
+        except (json.JSONDecodeError, OSError) as e:
+            logger.debug(f"Could not read checkpoint mode: {e}")
             return None
     
     def save_failed_series(self):
@@ -395,25 +397,29 @@ class BsToScraper:
             for item in self.failed_links:
                 merged[_url_key(item)] = item
             self._atomic_write_json(self.failed_file, list(merged.values()))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save failed series list: {e}")
+            print(f"  ⚠ Warning: could not save failed series list: {e}")
     
     def load_failed_series(self):
         try:
-            if os.path.exists(self.failed_file):
-                with open(self.failed_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                    return data or []
-        except Exception:
-            pass
-        return []
+            with open(self.failed_file, 'r', encoding='utf-8') as f:
+                return json.load(f) or []
+        except FileNotFoundError:
+            return []
+        except json.JSONDecodeError as e:
+            logger.warning(f"Failed series file corrupted, ignoring: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"Could not load failed series: {e}")
+            return []
     
     def clear_failed_series(self):
         try:
             if os.path.exists(self.failed_file):
                 os.remove(self.failed_file)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not remove failed series file: {e}")
     
     def is_pause_requested(self):
         return os.path.exists(self.pause_file)
@@ -422,8 +428,8 @@ class BsToScraper:
         try:
             if os.path.exists(self.pause_file):
                 os.remove(self.pause_file)
-        except Exception:
-            pass
+        except OSError as e:
+            logger.debug(f"Could not remove pause file: {e}")
     
     def save_worker_pid(self, worker_id, pid):
         """Track a worker's geckodriver PID (thread-safe, atomic)."""
@@ -431,8 +437,8 @@ class BsToScraper:
             self.worker_pids[str(worker_id)] = pid
             try:
                 self._atomic_write_json(self.worker_pids_file, dict(self.worker_pids))
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"Failed to save worker PID {worker_id}: {e}")
     
     def clear_worker_pids(self):
         with self._worker_lock:
@@ -440,8 +446,8 @@ class BsToScraper:
             try:
                 if os.path.exists(self.worker_pids_file):
                     os.remove(self.worker_pids_file)
-            except Exception:
-                pass
+            except OSError as e:
+                logger.debug(f"Could not remove worker PIDs file: {e}")
     
     # ==================== DRIVER SETUP ====================
     
@@ -1104,7 +1110,13 @@ class BsToScraper:
 
         def worker_loop(worker_id):
             nonlocal completed, failed
-            driver = self._create_worker_driver(worker_id)
+            driver = None
+            try:
+                driver = self._create_worker_driver(worker_id)
+            except Exception as e:
+                logger.error(f"Worker #{worker_id}: failed to create driver: {e}")
+                print(f"  ✗ Worker #{worker_id}: Failed to create browser: {str(e)[:80]}")
+                return
             success_delay = self.get_timing('success_delay') or 0.2
             backoff_base = self.get_timing('error_backoff_base') or 0.5
             backoff_max = self.get_timing('error_backoff_max') or 5.0
@@ -1360,7 +1372,7 @@ class BsToScraper:
                     })
                 except Exception:
                     continue
-            driver.get(self.get_site_url())
+            driver.refresh()
             return True
         except Exception:
             return False
