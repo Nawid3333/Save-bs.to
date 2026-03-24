@@ -312,11 +312,24 @@ class BsToScraper:
             return None
     
     def save_failed_series(self):
-        """Persist failed series links for later retry (atomic write)."""
+        """Persist failed series links for later retry (atomic write).
+        
+        Merges with any existing failed series from previous runs so no
+        failures are lost across multiple scraping sessions.
+        """
         if not self.failed_links:
             return
         try:
-            self._atomic_write_json(self.failed_file, list(self.failed_links))
+            existing = self.load_failed_series()
+            # Merge: index existing by URL, then overlay with new failures
+            def _url_key(item):
+                if isinstance(item, dict):
+                    return item.get('url', item.get('link', ''))
+                return str(item)
+            merged = {_url_key(item): item for item in existing}
+            for item in self.failed_links:
+                merged[_url_key(item)] = item
+            self._atomic_write_json(self.failed_file, list(merged.values()))
         except Exception:
             pass
     
