@@ -6,6 +6,7 @@ Automatically scrapes watched TV series from bs.to with configurable selectors
 import atexit
 import json
 import os
+import queue
 import random
 import re
 import signal
@@ -1047,13 +1048,12 @@ class BsToScraper:
         max_workers_allowed = worker_cap if worker_cap is not None else MAX_WORKERS
         worker_count = min(max_workers_allowed, total_series) or 1
         
-        # Pre-partition work: divide series evenly among workers
-        worker_pools = [[] for _ in range(worker_count)]
-        for idx, series in enumerate(filtered_series):
-            worker_pools[idx % worker_count].append(series)
+        # Shared work queue — all workers pull from the same pool
+        work_queue = queue.Queue()
+        for item in filtered_series:
+            work_queue.put(item)
         
-        pool_sizes = [len(p) for p in worker_pools]
-        print(f"→ Pre-partitioned {total_series} series across {worker_count} workers ({min(pool_sizes)}-{max(pool_sizes)} each)")
+        print(f"→ {total_series} series queued for {worker_count} workers (shared work queue)")
 
         def progress_line(done, total, title, watched=None, episode_total=None, empty=False, error=None, worker_id=None, season_labels=None):
             elapsed = time.time() - start_time
@@ -1073,7 +1073,7 @@ class BsToScraper:
             else:
                 print(f"[{done+failed}/{total}] [{bar}] {pct}% | ETA: {eta_mins}m{worker_info} | ✓ {title}{season_info}: {watched}/{episode_total} watched")
 
-        def worker_loop(worker_id, my_series_list):
+        def worker_loop(worker_id):
             nonlocal completed, failed
             driver = self._create_worker_driver(worker_id)
             success_delay = self.get_timing('success_delay') or 0.2
@@ -1118,21 +1118,21 @@ class BsToScraper:
                     continue
             
             if not authenticated:
-                print(f"  ✗ Worker #{worker_id}: Failed to authenticate after {max_auth_retries} attempts. Aborting to prevent incorrect data.")
+                print(f"  ✗ Worker #{worker_id}: Failed to authenticate after {max_auth_retries} attempts. Items remain in queue for other workers.")
                 # Close the driver before bailing out
                 try:
                     driver.quit()
                 except Exception:
                     pass
-                # Add all this worker's series to failed_links so they can be retried
-                with lock:
-                    for s in my_series_list:
-                        self.failed_links.append(s)
-                    failed += len(my_series_list)
-                return  # Exit worker without processing
+                return  # Exit worker — remaining items stay in queue for other workers
 
-            # Process dedicated series list (no queue competition)
-            for series in my_series_list:
+            # Pull work from shared queue until empty or stopped
+            while not stop_event.is_set():
+                try:
+                    series = work_queue.get_nowait()
+                except queue.Empty:
+                    break  # No more work
+                
                 if stop_event.is_set():
                     break
                     
@@ -1226,11 +1226,10 @@ class BsToScraper:
         futures = []
         try:
             for worker_id in range(1, worker_count + 1):
-                worker_pool = worker_pools[worker_id - 1]
-                print(f"  🔺 Worker #{worker_id} starting ({len(worker_pool)} series)")
-                futures.append(executor.submit(worker_loop, worker_id, worker_pool))
+                print(f"  🔺 Worker #{worker_id} starting")
+                futures.append(executor.submit(worker_loop, worker_id))
 
-            # Wait for all workers to complete (not just queue to empty)
+            # Wait for all workers to complete
             for f in as_completed(futures):
                 pass
         except KeyboardInterrupt:
@@ -1248,6 +1247,19 @@ class BsToScraper:
                     f.result()
                 except Exception:
                     pass
+
+        # Drain any remaining items from queue (e.g. all workers died)
+        orphaned = 0
+        while True:
+            try:
+                item = work_queue.get_nowait()
+                self.failed_links.append(item)
+                failed += 1
+                orphaned += 1
+            except queue.Empty:
+                break
+        if orphaned:
+            print(f"  ⚠ {orphaned} series were not picked up by any worker — saved for retry")
 
         # Save final checkpoint to capture any progress since last periodic save
         self.save_checkpoint()
