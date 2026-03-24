@@ -91,7 +91,7 @@ def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
     return result
 
 
-def print_changes(old_data, new_data):
+def detect_changes(old_data, new_data):
     """Detect changes between old and new data. Returns dict of change lists.
 
     Does not track 'removed series' because partial scrapes would
@@ -150,7 +150,7 @@ def print_changes(old_data, new_data):
     return changes
 
 
-def display_changes(changes, include_unwatched=True, include_watched=True, new_data=None):
+def show_changes(changes, include_unwatched=True, include_watched=True, new_data=None):
     """Print formatted change summary with pagination."""
     total = 0
     for k, v in changes.items():
@@ -344,7 +344,7 @@ def confirm_and_save_changes(new_data, description="data"):
     else:
         new_dict = dict(new_data)
 
-    changes = print_changes(old_data, new_dict)
+    changes = detect_changes(old_data, new_dict)
     logger.info(f"Detected changes: { {k: len(v) for k,v in changes.items()} }")
 
     allow_watched, allow_unwatched = _prompt_watch_status_changes(changes, new_dict)
@@ -366,7 +366,7 @@ def confirm_and_save_changes(new_data, description="data"):
         logger.info(f"No changes to save for {description}.")
         return True
 
-    display_changes(changes, include_unwatched=False, include_watched=False, new_data=new_dict)
+    show_changes(changes, include_unwatched=False, include_watched=False, new_data=new_dict)
 
     if input(f"\nSave these changes? (y/n): ").strip().lower() != 'y':
         print("\u2717 Changes discarded. Nothing saved.")

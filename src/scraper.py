@@ -44,6 +44,7 @@ _DOMAIN_STRIP_RE = re.compile(r'^https?://[^/]+')
 # Navigation/utility pages to filter out from series listings
 _UTILITY_PAGES = {'alle serien', 'andere serien', 'beliebte serien', 'neue serien', 'empfehlung', 'meistgesehen'}
 _SERIE_PATH_RE = re.compile(r'(/serie/[^/]+)')
+_SERIE_SLUG_RE = re.compile(r'^/serie/([^/?#]+)/?$')
 
 
 def is_regular_season(season_label):
@@ -170,6 +171,7 @@ class BsToScraper:
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
         self._worker_lock = threading.Lock()
         self._checkpoint_mode = None
+        self._use_parallel = USE_PARALLEL
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
@@ -611,7 +613,7 @@ class BsToScraper:
                             'url': f"{site_url}{href}"
                         })
             
-            # Remove duplicates while preserving order
+            # Remove duplicates while preserving order (by slug for resilience)
             seen = set()
             unique_series = []
             for s in series_list:
@@ -622,8 +624,9 @@ class BsToScraper:
                              any(keyword in title_normalized for keyword in _UTILITY_PAGES))
                 if is_utility:
                     continue
-                if s['link'] not in seen:
-                    seen.add(s['link'])
+                slug = self.get_series_slug_from_url(s['link'])
+                if slug != 'unknown' and slug not in seen:
+                    seen.add(slug)
                     unique_series.append(s)
             
             print(f"✓ Found {len(unique_series)} unique series")
@@ -1363,19 +1366,48 @@ class BsToScraper:
     
     # ==================== DATA MANAGEMENT ====================
     
-    def load_existing_links(self):
-        """Load existing series links from the index (for new-only filtering)."""
+    def get_series_slug_from_url(self, url):
+        """Extract series slug from full URL or relative path.
+        
+        Handles both /serie/slug and full URLs with host.
+        
+        Returns:
+            str: Series slug (e.g., 'breaking-bad') or 'unknown' on failure
+        """
+        try:
+            if url.startswith('http'):
+                path = urlparse(url).path
+            else:
+                path = url
+            parts = path.split('/')
+            if 'serie' in parts:
+                idx = parts.index('serie')
+                if idx + 1 < len(parts) and parts[idx + 1]:
+                    return parts[idx + 1]
+            return 'unknown'
+        except Exception:
+            return 'unknown'
+
+    def load_existing_slugs(self):
+        """Load existing series slugs from the index (for new-only filtering)."""
         existing = set()
         try:
             if os.path.exists(SERIES_INDEX_FILE):
                 with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                     data = json.load(f)
-                for item in data or []:
-                    link = item.get('link')
-                    if link:
-                        existing.add(link)
+                if isinstance(data, list):
+                    for item in data or []:
+                        url = item.get('url', '') or item.get('link', '')
+                        if url:
+                            existing.add(self.get_series_slug_from_url(url))
+                elif isinstance(data, dict):
+                    for v in data.values():
+                        url = v.get('url', '') or v.get('link', '')
+                        if url:
+                            existing.add(self.get_series_slug_from_url(url))
         except Exception:
             pass
+        existing.discard('unknown')
         return existing
     
     def scrape_new_series_only(self):
@@ -1383,9 +1415,10 @@ class BsToScraper:
         time.sleep(self.get_timing('initial_delay'))
         
         all_series = self.get_all_series()
-        existing_links = self.load_existing_links()
+        existing_slugs = self.load_existing_slugs()
 
-        new_series_list = [s for s in all_series if s.get('link') not in existing_links]
+        new_series_list = [s for s in all_series
+                          if self.get_series_slug_from_url(s.get('link', '')) not in existing_slugs]
 
         print(f"→ New series to scrape: {len(new_series_list)} (out of {len(all_series)})")
         self.series_data = []
