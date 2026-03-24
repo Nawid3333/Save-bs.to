@@ -51,33 +51,87 @@ def is_regular_season(season_label):
     return bool(_SEASON_LABEL_RE.search(season_label.strip()))
 
 
+def _is_pid_alive(pid):
+    """Check if a process with the given PID is still running."""
+    try:
+        if sys.platform == 'win32':
+            result = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
+                capture_output=True, check=False, text=True
+            )
+            return str(pid) in result.stdout
+        else:
+            os.kill(pid, 0)
+            return True
+    except Exception:
+        return False
+
+
+def cleanup_stale_worker_pids():
+    """Remove .worker_pids.json if all tracked processes are dead (e.g. after a hard kill).
+    Called once on module startup to handle orphaned workers from previous runs."""
+    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
+    if not os.path.exists(worker_pids_file):
+        return
+    try:
+        with open(worker_pids_file, 'r') as f:
+            pids = json.load(f)
+        if not pids:
+            os.remove(worker_pids_file)
+            return
+        any_alive = False
+        for worker_id, pid in pids.items():
+            if _is_pid_alive(pid):
+                any_alive = True
+                try:
+                    if sys.platform == 'win32':
+                        subprocess.run(
+                            ['taskkill', '/F', '/PID', str(pid), '/T'],
+                            capture_output=True, check=False
+                        )
+                    else:
+                        subprocess.run(
+                            ['kill', '-9', str(pid)],
+                            capture_output=True, check=False
+                        )
+                except Exception:
+                    pass
+        os.remove(worker_pids_file)
+    except Exception:
+        try:
+            os.remove(worker_pids_file)
+        except Exception:
+            pass
+
+
 def cleanup_geckodriver_processes():
     """Kill geckodriver processes we spawned (tracked by PID file)."""
-    try:
-        # Load tracked worker PIDs
-        worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
-        if os.path.exists(worker_pids_file):
-            try:
-                with open(worker_pids_file, 'r') as f:
-                    pids = json.load(f)
-                    for worker_id, pid in pids.items():
-                        try:
-                            if sys.platform == 'win32':
-                                subprocess.run(
-                                    ['taskkill', '/F', '/PID', str(pid), '/T'],
-                                    capture_output=True, check=False
-                                )
-                            else:
-                                subprocess.run(
-                                    ['kill', '-9', str(pid)],
-                                    capture_output=True, check=False
-                                )
-                        except Exception:
-                            pass
-            except Exception:
-                pass
-    except Exception:
-        pass
+    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
+    if os.path.exists(worker_pids_file):
+        try:
+            with open(worker_pids_file, 'r') as f:
+                pids = json.load(f)
+            for worker_id, pid in pids.items():
+                try:
+                    if sys.platform == 'win32':
+                        subprocess.run(
+                            ['taskkill', '/F', '/PID', str(pid), '/T'],
+                            capture_output=True, check=False
+                        )
+                    else:
+                        subprocess.run(
+                            ['kill', '-9', str(pid)],
+                            capture_output=True, check=False
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Always remove the PID file after cleanup attempt
+        try:
+            os.remove(worker_pids_file)
+        except Exception:
+            pass
 
 
 def _signal_handler(signum, frame):
@@ -85,10 +139,18 @@ def _signal_handler(signum, frame):
     sys.exit(0)
 
 
+# Auto-clean stale PID file on startup (handles hard-killed terminals)
+cleanup_stale_worker_pids()
+
 # Register cleanup handlers
 atexit.register(cleanup_geckodriver_processes)
 signal.signal(signal.SIGINT, _signal_handler)
 signal.signal(signal.SIGTERM, _signal_handler)
+
+# On Windows, also handle SIGBREAK which is sent when the console window is closed.
+# This ensures atexit handlers run and worker processes are cleaned up.
+if sys.platform == 'win32':
+    signal.signal(signal.SIGBREAK, _signal_handler)
 
 
 class BsToScraper:
