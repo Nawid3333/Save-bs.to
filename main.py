@@ -16,6 +16,9 @@ import subprocess
 import sys
 from urllib.parse import urlparse
 
+# Ensure project root is on sys.path so imports work from any working directory
+sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
+
 from config.config import USERNAME, PASSWORD, DATA_DIR, LOG_FILE
 from src.scraper import BsToScraper
 from src.index_manager import IndexManager, confirm_and_save_changes

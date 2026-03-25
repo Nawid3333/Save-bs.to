@@ -31,6 +31,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service as FirefoxService
+from selenium.common.exceptions import TimeoutException, WebDriverException
 
 from config.config import USERNAME, PASSWORD, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
 
@@ -39,6 +40,12 @@ logger = logging.getLogger(__name__)
 # Worker pool size — override via BS_MAX_WORKERS env var
 MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))
 USE_PARALLEL = True
+
+# Checkpoint frequency (save progress every N series)
+CHECKPOINT_EVERY = 10
+
+# Max retries for worker authentication
+MAX_AUTH_RETRIES = 3
 
 
 # Pre-compiled regex for season label detection
@@ -68,7 +75,7 @@ def _is_pid_alive(pid):
         else:
             os.kill(pid, 0)
             return True
-    except Exception:
+    except (OSError, ValueError):
         return False
 
 
@@ -88,7 +95,7 @@ def _kill_pids_in_file(pids_dict):
                     ['kill', '-9', str(pid)],
                     capture_output=True, check=False
                 )
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             pass
 
 
@@ -118,10 +125,10 @@ def cleanup_stale_worker_pids():
             # Owner is dead — kill geckodriver orphans and clean up
             _kill_pids_in_file(pids)
             os.remove(fpath)
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError):
             try:
                 os.remove(fpath)
-            except Exception:
+            except OSError:
                 pass
 
 
@@ -133,11 +140,11 @@ def cleanup_geckodriver_processes():
                 pids = json.load(f)
             if isinstance(pids, dict):
                 _kill_pids_in_file(pids)
-        except Exception:
+        except (OSError, json.JSONDecodeError, ValueError):
             pass
         try:
             os.remove(_MY_PID_FILE)
-        except Exception:
+        except OSError:
             pass
 
 
@@ -187,6 +194,8 @@ class BsToScraper:
         self._checkpoint_mode = None
         self._use_parallel = USE_PARALLEL
         self._season_max_retries = int(self.config.get('timing', {}).get('max_retries_season') or 0) or 3
+        self._last_pause_check = 0.0
+        self._pause_cached = False
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
@@ -512,7 +521,7 @@ class BsToScraper:
         except json.JSONDecodeError as e:
             logger.warning(f"Failed series file corrupted, ignoring: {e}")
             return []
-        except Exception as e:
+        except (OSError, TypeError) as e:
             logger.warning(f"Could not load failed series: {e}")
             return []
 
@@ -531,10 +540,15 @@ class BsToScraper:
                 logger.debug(f"Could not remove failed series file: {e}")
     
     def is_pause_requested(self):
-        """Check if pause was requested (safe: only checks without side effects)."""
+        """Check if pause was requested (cached: re-checks file at most every 2 seconds)."""
         try:
-            return os.path.exists(self.pause_file)
-        except Exception:
+            now = time.time()
+            if now - self._last_pause_check < 2.0:
+                return self._pause_cached
+            self._last_pause_check = now
+            self._pause_cached = os.path.exists(self.pause_file)
+            return self._pause_cached
+        except OSError:
             return False
     
     def clear_pause_request(self):
@@ -625,6 +639,10 @@ class BsToScraper:
             return local_xpi
         except Exception as e:
             print(f'⚠ Failed to download uBlock Origin: {e}')
+            try:
+                os.remove(local_xpi)
+            except OSError:
+                pass
             return None
     
     def _install_ublock(self, driver):
@@ -648,6 +666,7 @@ class BsToScraper:
         firefox_options = self._build_firefox_options()
         firefox_service = self._build_firefox_service()
         self.driver = webdriver.Firefox(service=firefox_service, options=firefox_options)
+        self.driver.set_page_load_timeout(self.get_timing_float('page_load_timeout', 20.0))
         
         # Track main driver PID for worker management
         try:
@@ -965,8 +984,13 @@ class BsToScraper:
                             row_classes = row_classes.split()
                         watched = bool(indicator_value and indicator_value in row_classes)
                     
+                    # Normalize episode number: use int where possible for proper sorting
+                    try:
+                        ep_num_normalized = int(ep_num)
+                    except (ValueError, TypeError):
+                        ep_num_normalized = str(ep_num)
                     episodes.append({
-                        'number': str(ep_num),  # Ensure string type
+                        'number': ep_num_normalized,
                         'title': str(title) if title else '',
                         'watched': bool(watched)  # Ensure bool type
                     })
@@ -1134,6 +1158,8 @@ class BsToScraper:
                                 self.login(driver)
 
                     
+                    episodes = []
+                    season_failed = True
                     for attempt in range(max_retries):
                         try:
                             driver.get(season_url)
@@ -1286,9 +1312,9 @@ class BsToScraper:
                             result['empty'] = False
                             print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ✓ {result['title']}{season_info}: {result['watched_episodes']}/{result['total_episodes']} watched")
                         self.series_data.append(result)
-                        # Save checkpoint every 10 series
+                        # Save checkpoint periodically
                         self.completed_links.add(series.get('link'))
-                        if idx % 10 == 0:
+                        if idx % CHECKPOINT_EVERY == 0:
                             self.save_checkpoint()
                     else:
                         print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ⚠ {series['title']}: Skipped (no data)")
@@ -1372,7 +1398,7 @@ class BsToScraper:
             try:
                 driver = self._create_worker_driver(worker_id)
             except Exception as e:
-                logger.error(f"Worker #{worker_id}: failed to create driver: {e}")
+                logger.error(f"Worker #{worker_id}: failed to create driver: {e}", exc_info=True)
                 print(f"  ✗ Worker #{worker_id}: Failed to create browser: {str(e)[:80]}")
                 return
             success_delay = self.get_timing_float('success_delay', 0.15)
@@ -1386,7 +1412,7 @@ class BsToScraper:
             
             # Share auth cookies from main driver
             authenticated = False
-            max_auth_retries = 3
+            max_auth_retries = MAX_AUTH_RETRIES
             auth_page_delay = self.get_timing_float('worker_auth_page_delay', 1.0)
             auth_retry_delay = self.get_timing_float('worker_auth_retry_delay', 1.0)
             for attempt in range(max_auth_retries):
@@ -1444,7 +1470,7 @@ class BsToScraper:
                             self.series_data.append(result)
                             self.completed_links.add(series.get('link'))
                             completed += 1
-                            if completed % 10 == 0:
+                            if completed % CHECKPOINT_EVERY == 0:
                                 self.save_checkpoint()
                             watched = result.get('watched_episodes', 0)
                             total_eps = result.get('total_episodes', 0)
@@ -1477,7 +1503,7 @@ class BsToScraper:
                             error_streak = 0
                             print(f"  ✓ Worker #{worker_id}: Browser restarted")
                         except Exception as restart_err:
-                            logger.error(f"Worker #{worker_id}: Failed to restart driver: {restart_err}")
+                            logger.error(f"Worker #{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
                             break
                         continue
                     with lock:
@@ -1629,6 +1655,7 @@ class BsToScraper:
             service = self._build_firefox_service()
             
             driver = webdriver.Firefox(service=service, options=firefox_options)
+            driver.set_page_load_timeout(self.get_timing_float('page_load_timeout', 20.0))
             
             # Install uBlock Origin for ad-blocking
             try:
@@ -1658,10 +1685,15 @@ class BsToScraper:
             
             return driver
         except Exception as e:
-            # Clean up any partial driver created before error
+            # Clean up any partial driver/service created before error
             if driver:
                 try:
                     driver.quit()
+                except Exception:
+                    pass
+            elif hasattr(service, 'process') and service.process:
+                try:
+                    service.stop()
                 except Exception:
                     pass
             raise Exception(f"Failed to create worker driver: {str(e)}")
@@ -1685,11 +1717,11 @@ class BsToScraper:
                         'secure': cookie.get('secure', False),
                         'httpOnly': cookie.get('httpOnly', False)
                     })
-                except Exception:
+                except WebDriverException:
                     continue
             driver.refresh()
             return True
-        except Exception:
+        except (WebDriverException, TimeoutException):
             return False
     
     # ==================== DATA MANAGEMENT ====================

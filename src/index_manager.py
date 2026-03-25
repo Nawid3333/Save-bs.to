@@ -89,6 +89,29 @@ def _atomic_write_json(filepath, data):
 _SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 
 
+def _validate_series_entry(series, title=''):
+    """Validate that a series entry has the required structure. Returns True if valid."""
+    if not isinstance(series, dict):
+        logger.warning(f"Skipping invalid series entry (not dict): {title}")
+        return False
+    if not series.get('url'):
+        logger.warning(f"Skipping series '{title}' - missing 'url' field")
+        return False
+    seasons = series.get('seasons')
+    if seasons is not None and not isinstance(seasons, list):
+        logger.warning(f"Skipping series '{title}' - 'seasons' must be list, got {type(seasons)}")
+        return False
+    # Validate episode structure within seasons
+    for season in (seasons or []):
+        if not isinstance(season, dict):
+            continue
+        episodes = season.get('episodes')
+        if episodes is not None and not isinstance(episodes, list):
+            logger.warning(f"Series '{title}' season '{season.get('season', '?')}' has invalid episodes type")
+            season['episodes'] = []
+    return True
+
+
 def _find_series(new_data, title):
     """Look up a series by title in either a dict or list."""
     if isinstance(new_data, dict):
@@ -246,7 +269,7 @@ def detect_changes(old_data, new_data):
                         continue
                     ep_num = ep.get('number')
                     if ep_num is not None:  # Allow 0 as valid episode number
-                        old_eps[(s_label, ep_num)] = bool(ep.get('watched', False))
+                        old_eps[(s_label, str(ep_num))] = bool(ep.get('watched', False))
             
             # Check new episodes and watch status changes
             for season in new_series.get('seasons', []):
@@ -259,7 +282,7 @@ def detect_changes(old_data, new_data):
                     ep_num = ep.get('number')
                     if ep_num is None:  # Skip episodes without numbers
                         continue
-                    ep_key = (s_label, ep_num)
+                    ep_key = (s_label, str(ep_num))
                     new_watched = bool(ep.get('watched', False))
                     
                     if ep_key not in old_eps:
@@ -437,9 +460,9 @@ def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
         for new_season in new_entry.get('seasons', []):
             season_label = new_season.get('season')
             if season_label in old_seasons:
-                old_eps = {ep.get('number'): ep for ep in old_seasons[season_label].get('episodes', [])}
+                old_eps = {str(ep.get('number')): ep for ep in old_seasons[season_label].get('episodes', [])}
                 for new_ep in new_season.get('episodes', []):
-                    ep_num = new_ep.get('number')
+                    ep_num = str(new_ep.get('number'))
                     if ep_num in old_eps:
                         old_watched = old_eps[ep_num].get('watched', False)
                         new_watched = new_ep.get('watched', False)
@@ -557,9 +580,12 @@ class IndexManager:
             else:
                 self.series_index = {}
             
-            # Validation: Check that loaded data is not empty or invalid
-            if self.series_index and not any(s.get('title') for s in self.series_index.values()):
-                raise ValueError("Loaded index contains invalid entries")
+            # Validate each series entry has required structure
+            validated = {}
+            for title, series in self.series_index.items():
+                if _validate_series_entry(series, title):
+                    validated[title] = series
+            self.series_index = validated
             
             print(f"[OK] Loaded {len(self.series_index)} series from index")
             logger.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
