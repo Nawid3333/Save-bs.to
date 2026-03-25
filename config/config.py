@@ -34,5 +34,4 @@ def load_selectors_config():
 SELECTORS_CONFIG = load_selectors_config()
 
 # Scraping configuration
-TIMEOUT = SELECTORS_CONFIG.get("timing", {}).get("timeout", 10)
 HEADLESS = True  # Set to False to see browser automation

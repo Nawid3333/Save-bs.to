@@ -1,7 +1,9 @@
+import hashlib
 import json
 import logging
 import os
 import re
+import shutil
 import tempfile
 from collections import defaultdict
 from datetime import datetime
@@ -11,13 +13,67 @@ from config.config import SERIES_INDEX_FILE, DATA_DIR
 logger = logging.getLogger(__name__)
 
 
+def _compute_file_checksum(filepath):
+    """Compute SHA256 checksum of a file for corruption detection."""
+    try:
+        sha256_hash = hashlib.sha256()
+        with open(filepath, 'rb') as f:
+            for byte_block in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(byte_block)
+        return sha256_hash.hexdigest()
+    except Exception as e:
+        logger.warning(f"Could not compute checksum for {filepath}: {e}")
+        return None
+
+
+def _create_file_backup(filepath):
+    """Create a backup of a file (up to 3 generations kept)."""
+    if not os.path.exists(filepath):
+        return
+    try:
+        backup_dir = os.path.dirname(filepath)
+        filename = os.path.basename(filepath)
+        
+        # Remove oldest backup if 3 already exist
+        for i in range(3, 10):
+            old_backup = os.path.join(backup_dir, f"{filename}.bak{i}")
+            if os.path.exists(old_backup):
+                try:
+                    os.remove(old_backup)
+                except OSError:
+                    pass
+        
+        # Shift existing backups: .bak2 -> .bak3, .bak1 -> .bak2, original -> .bak1
+        for i in range(2, 0, -1):
+            src = os.path.join(backup_dir, f"{filename}.bak{i}")
+            dst = os.path.join(backup_dir, f"{filename}.bak{i+1}")
+            if os.path.exists(src):
+                try:
+                    shutil.move(src, dst)
+                except OSError:
+                    pass
+        
+        # Create new backup
+        backup_path = os.path.join(backup_dir, f"{filename}.bak1")
+        shutil.copy2(filepath, backup_path)
+        logger.debug(f"Created backup: {backup_path}")
+    except Exception as e:
+        logger.warning(f"Could not create backup of {filepath}: {e}")
+
+
 def _atomic_write_json(filepath, data):
     """Write JSON to file atomically via temp file + os.replace.
     
+    Creates backup before writing to prevent data loss on corruption.
     Prevents corrupted files if the process is killed mid-write.
     """
     dirpath = os.path.dirname(filepath)
     os.makedirs(dirpath, exist_ok=True)
+    
+    # Create backup of existing file before overwriting
+    if os.path.exists(filepath):
+        _create_file_backup(filepath)
+    
     fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix='.tmp')
     try:
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -51,6 +107,28 @@ def _get_season_stats(series, season_label):
             eps = s.get('episodes', [])
             return len(eps), sum(1 for ep in eps if ep.get('watched', False))
     return 0, 0
+
+
+def _order_series_entry(series):
+    """Return a stable series dict with series-level metadata before seasons."""
+    ordered = {
+        'title': series.get('title', ''),
+        'link': series.get('link', ''),
+        'url': series.get('url', ''),
+        'total_seasons': series.get('total_seasons', len(series.get('seasons', []))),
+        'total_episodes': series.get('total_episodes', 0),
+        'watched_episodes': series.get('watched_episodes', 0),
+        'unwatched_episodes': series.get(
+            'unwatched_episodes',
+            series.get('total_episodes', 0) - series.get('watched_episodes', 0)
+        ),
+        'seasons': series.get('seasons', []),
+    }
+    if 'added_date' in series:
+        ordered['added_date'] = series['added_date']
+    if 'last_updated' in series:
+        ordered['last_updated'] = series['last_updated']
+    return ordered
 
 
 def paginate_list(items, formatter, page_size=50):
@@ -117,6 +195,7 @@ def detect_changes(old_data, new_data):
 
     Does not track 'removed series' because partial scrapes would
     incorrectly show all non-scraped series as removed.
+    Handles missing/None fields safely.
     """
     changes = {
         "new_series": [],
@@ -125,48 +204,77 @@ def detect_changes(old_data, new_data):
         "newly_unwatched": []     # watched → unwatched (needs separate confirmation)
     }
     
-    old_titles = set(old_data.keys()) if isinstance(old_data, dict) else {s.get('title') for s in old_data}
-    new_titles = set(new_data.keys()) if isinstance(new_data, dict) else {s.get('title') for s in new_data}
+    # Handle empty or invalid data
+    if not old_data:
+        old_data = []
+    if not new_data:
+        new_data = []
+    
+    old_titles = set(old_data.keys()) if isinstance(old_data, dict) else {s.get('title') for s in (old_data or []) if s and s.get('title')}
+    new_titles = set(new_data.keys()) if isinstance(new_data, dict) else {s.get('title') for s in (new_data or []) if s and s.get('title')}
     
     # Convert to dicts if needed
     if isinstance(old_data, list):
-        old_data = {s.get('title'): s for s in old_data}
+        old_data = {s.get('title'): s for s in (old_data or []) if s and s.get('title')}
     if isinstance(new_data, list):
-        new_data = {s.get('title'): s for s in new_data}
+        new_data = {s.get('title'): s for s in (new_data or []) if s and s.get('title')}
     
     # New series (in scraped data but not in existing index)
     for title in new_titles - old_titles:
-        changes["new_series"].append(title)
+        if title:  # Skip None titles
+            changes["new_series"].append(title)
     
     # Episode changes for existing series
     for title in old_titles & new_titles:
-        old_series = old_data[title]
-        new_series = new_data[title]
-        
-        # Build map of (season, ep_number) -> watched status for old data
-        old_eps = {}
-        for season in old_series.get('seasons', []):
-            s_label = season.get('season', '')
-            for ep in season.get('episodes', []):
-                old_eps[(s_label, ep.get('number'))] = ep.get('watched', False)
-        
-        # Check new episodes and watch status changes
-        for season in new_series.get('seasons', []):
-            s_label = season.get('season', '')
-            for ep in season.get('episodes', []):
-                ep_num = ep.get('number')
-                ep_key = (s_label, ep_num)
-                new_watched = ep.get('watched', False)
-                
-                if ep_key not in old_eps:
-                    # Brand new episode
-                    changes["new_episodes"].append((title, s_label, ep_num))
-                elif old_eps[ep_key] != new_watched:
-                    # Watch status changed
-                    if old_eps[ep_key] is False and new_watched is True:
-                        changes["newly_watched"].append((title, s_label, ep_num))
-                    elif old_eps[ep_key] is True and new_watched is False:
-                        changes["newly_unwatched"].append((title, s_label, ep_num))
+        try:
+            old_series = old_data.get(title, {})
+            new_series = new_data.get(title, {})
+            
+            if not old_series or not isinstance(old_series, dict):
+                continue
+            if not new_series or not isinstance(new_series, dict):
+                continue
+            
+            # Build map of (season, ep_number) -> watched status for old data
+            old_eps = {}
+            for season in old_series.get('seasons', []):
+                if not season or not isinstance(season, dict):
+                    continue
+                s_label = season.get('season', '')
+                for ep in season.get('episodes', []):
+                    if not ep or not isinstance(ep, dict):
+                        continue
+                    ep_num = ep.get('number')
+                    if ep_num is not None:  # Allow 0 as valid episode number
+                        old_eps[(s_label, ep_num)] = bool(ep.get('watched', False))
+            
+            # Check new episodes and watch status changes
+            for season in new_series.get('seasons', []):
+                if not season or not isinstance(season, dict):
+                    continue
+                s_label = season.get('season', '')
+                for ep in season.get('episodes', []):
+                    if not ep or not isinstance(ep, dict):
+                        continue
+                    ep_num = ep.get('number')
+                    if ep_num is None:  # Skip episodes without numbers
+                        continue
+                    ep_key = (s_label, ep_num)
+                    new_watched = bool(ep.get('watched', False))
+                    
+                    if ep_key not in old_eps:
+                        # Brand new episode
+                        changes["new_episodes"].append((title, s_label, ep_num))
+                    elif old_eps[ep_key] != new_watched:
+                        # Watch status changed
+                        if not old_eps[ep_key] and new_watched:
+                            changes["newly_watched"].append((title, s_label, ep_num))
+                        elif old_eps[ep_key] and not new_watched:
+                            changes["newly_unwatched"].append((title, s_label, ep_num))
+        except Exception as e:
+            # Log and continue on errors for individual series
+            logger.debug(f"Error detecting changes for '{title}': {e}")
+            continue
     
     return changes
 
@@ -236,14 +344,16 @@ def _load_existing_index():
             logger.error("Index file is not a valid list or dict.")
             return []
         logger.info(f"Loaded index from {SERIES_INDEX_FILE} ({len(data)} entries)")
-        return data    except json.JSONDecodeError as e:
+        return data
+    except json.JSONDecodeError as e:
         print(f"[ERROR] Index file corrupted: {e}")
         logger.error(f"Index file corrupted: {e}")
         return []
     except OSError as e:
         print(f"[ERROR] Cannot read index file: {e}")
         logger.error(f"Cannot read index file: {e}")
-        return []    except Exception as e:
+        return []
+    except Exception as e:
         print(f"\u26a0 Error loading index: {str(e)}")
         logger.error(f"Error loading index: {str(e)}")
         return []
@@ -318,19 +428,16 @@ def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
     for title, new_entry in new_dict.items():
         if title not in merged:
             new_entry['added_date'] = datetime.now().isoformat()
-            new_entry['status'] = 'active'
-            merged[title] = new_entry
+            merged[title] = _order_series_entry(new_entry)
             continue
 
         old_entry = merged[title]
-        old_entry['status'] = 'active'
         old_seasons = {s.get('season'): s for s in old_entry.get('seasons', [])}
 
         for new_season in new_entry.get('seasons', []):
             season_label = new_season.get('season')
             if season_label in old_seasons:
                 old_eps = {ep.get('number'): ep for ep in old_seasons[season_label].get('episodes', [])}
-                merged_episodes = []
                 for new_ep in new_season.get('episodes', []):
                     ep_num = new_ep.get('number')
                     if ep_num in old_eps:
@@ -342,12 +449,13 @@ def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
                             new_ep['watched'] = False
                         else:
                             new_ep['watched'] = old_watched
-                    merged_episodes.append(new_ep)
-                old_seasons[season_label]['episodes'] = merged_episodes
+                    old_eps[ep_num] = new_ep  # update existing or add new
+                old_seasons[season_label]['episodes'] = list(old_eps.values())
             else:
                 old_seasons[season_label] = new_season
 
         old_entry['seasons'] = list(old_seasons.values())
+        old_entry['total_seasons'] = len(old_entry['seasons'])
         old_entry['watched_episodes'] = sum(
             sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
             for s in old_entry['seasons']
@@ -356,8 +464,10 @@ def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
             len(s.get('episodes', []))
             for s in old_entry['seasons']
         )
+        old_entry['unwatched_episodes'] = old_entry['total_episodes'] - old_entry['watched_episodes']
         old_entry['url'] = new_entry.get('url', old_entry.get('url'))
         old_entry['last_updated'] = datetime.now().isoformat()
+        merged[title] = _order_series_entry(old_entry)
 
     return merged
 
@@ -393,7 +503,7 @@ def confirm_and_save_changes(new_data, description="data"):
         logger.info(f"No changes to save for {description}.")
         return True
 
-    show_changes(changes, include_unwatched=False, include_watched=False, new_data=new_dict)
+    show_changes(changes, include_unwatched=allow_unwatched, include_watched=allow_watched, new_data=new_dict)
 
     if input(f"\nSave these changes? (y/n): ").strip().lower() != 'y':
         print("\u2717 Changes discarded. Nothing saved.")
@@ -401,7 +511,7 @@ def confirm_and_save_changes(new_data, description="data"):
         return False
 
     try:
-        series_list = list(merged.values())
+        series_list = [_order_series_entry(series) for series in merged.values()]
         _atomic_write_json(SERIES_INDEX_FILE, series_list)
         print(f"\u2713 Saved {len(series_list)} series to index")
         logger.info(f"Saved {len(series_list)} series to {SERIES_INDEX_FILE}")
@@ -422,13 +532,19 @@ class IndexManager:
         os.makedirs(DATA_DIR, exist_ok=True)
 
     def load_index(self):
-        """Load series index from JSON, converting both list and dict formats to dict."""
+        """Load series index from JSON with corruption detection.
+        
+        Converts both list and dict formats to dict format.
+        Validates loaded data for consistency.
+        """
         self.series_index = {}
         if not os.path.exists(SERIES_INDEX_FILE):
+            logger.info(f"No existing index found at {SERIES_INDEX_FILE}")
             return
         try:
             with open(SERIES_INDEX_FILE, 'r', encoding='utf-8') as f:
                 data = json.load(f)
+            
             # Handle both formats robustly
             if isinstance(data, list):
                 self.series_index = {item.get("title"): item for item in data if item.get("title")}
@@ -440,6 +556,11 @@ class IndexManager:
                     self.series_index = {item.get("title"): item for item in data.values() if isinstance(item, dict) and item.get("title")}
             else:
                 self.series_index = {}
+            
+            # Validation: Check that loaded data is not empty or invalid
+            if self.series_index and not any(s.get('title') for s in self.series_index.values()):
+                raise ValueError("Loaded index contains invalid entries")
+            
             print(f"[OK] Loaded {len(self.series_index)} series from index")
             logger.info(f"Loaded {len(self.series_index)} series from {SERIES_INDEX_FILE}")
         except json.JSONDecodeError as e:

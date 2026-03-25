@@ -9,6 +9,7 @@ and interactive change confirmation before saving.
 
 import json
 import logging
+import logging.handlers
 import os
 import re
 import subprocess
@@ -24,7 +25,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        logging.handlers.RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
@@ -164,6 +165,9 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
             print(f"\n⚠ {no_data_msg}")
             logger.warning(no_data_msg)
 
+        # Scraping completed normally — safe to clear checkpoint now that user has confirmed/declined
+        scraper.clear_checkpoint()
+
         if scraper.failed_links:
             print(f"\n⚠ {len(scraper.failed_links)} series failed during scraping.")
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
@@ -172,9 +176,16 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
     except OSError as e:
         print(f"\n✗ Network error occurred: {str(e)}")
         logger.error(f"Network error in {description}: {e}")
-    except KeyboardInterrupt:
-        print("\n⚠ Scraping interrupted by user")
-        logger.info(f"{description} interrupted by user")
+    except (KeyboardInterrupt, SystemExit):
+        print(f"\n⚠ Scraping interrupted by Ctrl+C")
+        if 'scraper' in locals() and scraper.series_data:
+            if confirm_and_save_changes(scraper.series_data, description):
+                print(f"\n✓ Partial data saved ({len(scraper.series_data)} series)")
+                logger.info(f"{description} interrupted — partial data saved")
+        if 'scraper' in locals() and scraper.failed_links:
+            print(f"\n⚠ {len(scraper.failed_links)} series failed.")
+            print("→ Use option 6 (Retry failed series) to rescrape these later.")
+        return scraper if 'scraper' in locals() else None
     except Exception as e:
         print(f"\n✗ Unexpected error: {str(e)}")
         logger.error(f"Unexpected error in {description}: {e}")

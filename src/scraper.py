@@ -8,16 +8,19 @@ checkpoints, retry, and atomic JSON writes.
 
 import atexit
 import json
+import logging
 import os
 import queue
 import random
 import re
+import shutil
 import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urljoin, urlparse
 
@@ -29,7 +32,9 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service as FirefoxService
 
-from config.config import USERNAME, PASSWORD, TIMEOUT, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
+from config.config import USERNAME, PASSWORD, HEADLESS, DATA_DIR, SERIES_INDEX_FILE, SELECTORS_CONFIG
+
+logger = logging.getLogger(__name__)
 
 # Worker pool size — override via BS_MAX_WORKERS env var
 MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))
@@ -38,7 +43,6 @@ USE_PARALLEL = True
 
 # Pre-compiled regex for season label detection
 _SEASON_LABEL_RE = re.compile(r'^(staffel|season|s)?\s*\d+$', re.IGNORECASE)
-_SEASON_NUMBER_RE = re.compile(r'(staffel|season|s)\s*(\d+)', re.IGNORECASE)
 _DOMAIN_STRIP_RE = re.compile(r'^https?://[^/]+')
 
 # Navigation/utility pages to filter out from series listings
@@ -79,23 +83,10 @@ def cleanup_stale_worker_pids():
         if not isinstance(pids, dict) or not pids:
             os.remove(worker_pids_file)
             return
-        any_alive = False
-        for worker_id, pid in pids.items():
-            if _is_pid_alive(pid):
-                any_alive = True
-                try:
-                    if sys.platform == 'win32':
-                        subprocess.run(
-                            ['taskkill', '/F', '/PID', str(pid), '/T'],
-                            capture_output=True, check=False
-                        )
-                    else:
-                        subprocess.run(
-                            ['kill', '-9', str(pid)],
-                            capture_output=True, check=False
-                        )
-                except Exception:
-                    pass
+        # If any tracked PID is still alive, another instance may be running — don't interfere
+        if any(_is_pid_alive(pid) for pid in pids.values()):
+            return
+        # All PIDs are dead — safe to clean up the stale file
         os.remove(worker_pids_file)
     except Exception:
         try:
@@ -155,6 +146,11 @@ if sys.platform == 'win32':
     signal.signal(signal.SIGBREAK, _signal_handler)
 
 
+class ScrapingPaused(Exception):
+    """Raised when scraping is paused via pause file. Triggers checkpoint save in run()."""
+    pass
+
+
 class BsToScraper:
     """Config-based web scraper for BS.TO series"""
     
@@ -173,6 +169,7 @@ class BsToScraper:
         self._worker_lock = threading.Lock()
         self._checkpoint_mode = None
         self._use_parallel = USE_PARALLEL
+        self._season_max_retries = int(self.config.get('timing', {}).get('max_retries_season') or 0) or 3
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
@@ -209,8 +206,8 @@ class BsToScraper:
                 return None
         return value
     
-    def get_timing(self, key):
-        return self.config.get('timing', {}).get(key, 0.3)
+    def get_timing(self, key, default=0.3):
+        return self.config.get('timing', {}).get(key, default)
     
     def get_site_url(self):
         return self.config.get('site_url', 'https://bs.to')
@@ -230,13 +227,25 @@ class BsToScraper:
         return self.config.get('login_page', 'https://bs.to/login')
     
     def normalize_to_series_url(self, url):
-        """Normalize any bs.to series URL to its canonical form (e.g. https://bs.to/serie/Name)."""
+        """Normalize any bs.to series URL to its canonical form (e.g. https://bs.to/serie/Name).
+        Strips fragments and query strings.
+        """
+        if not url:
+            return url
+        
+        # Strip fragment (#) and query string (?) from URL
+        url = url.split('?')[0].split('#')[0]
+        
+        # Remove domain, keep path only
         url = _DOMAIN_STRIP_RE.sub("", url)
+        
+        # Extract /serie/Name part
         m = _SERIE_PATH_RE.match(url)
         if m:
             main_path = m.group(1)
         else:
             return url
+        
         site_url = self.get_site_url().rstrip("/")
         return f"{site_url}{main_path}"
     
@@ -267,11 +276,33 @@ class BsToScraper:
             'class': By.CLASS_NAME
         }
         return by_map.get(selector_type, By.CSS_SELECTOR)
+
+    def get_timing_float(self, key, default):
+        """Read a timing value from config as float (safe with None/missing values)."""
+        try:
+            value = self.get_timing(key, default)
+            if value is None:
+                return float(default) if default is not None else 0.0
+            return float(value)
+        except (ValueError, TypeError):
+            return float(default) if default is not None else 0.0
+
+    def get_timing_int(self, key, default):
+        """Read a timing value from config as int (safe with None/missing values)."""
+        try:
+            value = self.get_timing(key, default)
+            if value is None:
+                return int(default) if default is not None else 0
+            return int(float(value))
+        except (ValueError, TypeError):
+            return int(default) if default is not None else 0
     
-    def find_element_from_config(self, driver, config_selectors, timeout=2):
+    def find_element_from_config(self, driver, config_selectors, timeout=None):
         """Try each selector from config until one matches."""
         if not isinstance(config_selectors, list):
             config_selectors = [config_selectors]
+        if timeout is None:
+            timeout = self.get_timing_float('element_find_timeout', 2.0)
         
         for selector_config in config_selectors:
             selector_type = selector_config.get('type', 'css')
@@ -292,8 +323,7 @@ class BsToScraper:
     def wait_for_element(self, driver, selector_by, selector_value, timeout=None, silent=False):
         """Wait for element to be present. Returns True on success, False on timeout."""
         if timeout is None:
-            # Increase default timeout to 20 seconds for more reliability
-            timeout = self.get_timing('timeout') or 20
+            timeout = self.get_timing_float('timeout', 20.0)
         try:
             WebDriverWait(driver, timeout).until(
                 EC.presence_of_element_located((selector_by, selector_value))
@@ -307,62 +337,86 @@ class BsToScraper:
     def wait_for_css_element(self, driver, css_selector, timeout=None, silent=False):
         return self.wait_for_element(driver, By.CSS_SELECTOR, css_selector, timeout, silent)
     
+    def _wait_for_page_ready(self, driver=None, timeout=None):
+        """Wait for page to be fully loaded (DOM readyState == 'complete' + body present).
+        Returns as soon as the page is ready — no fixed sleep."""
+        drv = driver or self.driver
+        if timeout is None:
+            timeout = self.get_timing_float('page_ready_timeout', 10.0)
+        body_timeout = min(self.get_timing_float('page_ready_body_timeout', 3.0), timeout)
+        try:
+            WebDriverWait(drv, timeout).until(
+                lambda d: d.execute_script('return document.readyState') == 'complete'
+            )
+        except Exception:
+            pass
+        try:
+            WebDriverWait(drv, body_timeout).until(
+                EC.presence_of_element_located((By.TAG_NAME, 'body'))
+            )
+        except Exception:
+            pass
+    
     # ==================== CHECKPOINT SYSTEM ====================
     
     def save_checkpoint(self, include_data=False):
-        """Save completed-links checkpoint for resume (atomic write).
+        """Save completed-links checkpoint for resume (atomic write, thread-safe).
         
         Args:
             include_data: If True, also save series_data for full state preservation.
-                          Used on exit/crash. Periodic saves use False for speed.
+                          Used on exit/crash. Periodic saves use False.
         """
-        try:
-            checkpoint_data = {
-                'completed_links': list(self.completed_links),
-                'mode': self._checkpoint_mode,
-                'timestamp': time.time(),
-            }
-            if include_data and self.series_data:
-                checkpoint_data['series_data'] = self.series_data
-            self._atomic_write_json(self.checkpoint_file, checkpoint_data)
-        except Exception as e:
-            logger.error(f"Failed to save checkpoint: {e}")
-            print(f"  ⚠ Warning: checkpoint save failed: {e}")
+        with self._worker_lock:
+            try:
+                checkpoint_data = {
+                    'completed_links': list(self.completed_links),
+                    'mode': self._checkpoint_mode,
+                    'timestamp': time.time(),
+                }
+                if include_data and self.series_data:
+                    checkpoint_data['series_data'] = self.series_data
+                self._atomic_write_json(self.checkpoint_file, checkpoint_data)
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}")
+                print(f"  ⚠ Warning: checkpoint save failed: {e}")
     
     def load_checkpoint(self):
-        """Load checkpoint from a previous run. Returns True if loaded.
+        """Load checkpoint from a previous run (thread-safe). Returns True if loaded.
         
         Restores completed_links, mode, and series_data (if saved).
         """
-        if not os.path.exists(self.checkpoint_file):
-            return False
-        try:
-            with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            if isinstance(data, dict) and 'completed_links' in data:
-                self.completed_links = set(data.get('completed_links', []))
-                self._checkpoint_mode = data.get('mode')
-                saved_data = data.get('series_data', [])
-                if saved_data:
-                    self.series_data = saved_data
-                return True
-            elif isinstance(data, list):
-                # Backward compatibility: treat as list of completed links
-                self.completed_links = set(data)
-                return True
-            else:
-                print(f"✗ Checkpoint file is invalid or corrupted.")
+        with self._worker_lock:
+            if not os.path.exists(self.checkpoint_file):
                 return False
-        except Exception as e:
-            print(f"✗ Failed to load checkpoint: {e}")
-            return False
+            try:
+                with open(self.checkpoint_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and 'completed_links' in data:
+                    self.completed_links = set(data.get('completed_links', []))
+                    self._checkpoint_mode = data.get('mode')
+                    saved_data = data.get('series_data', [])
+                    if saved_data:
+                        self.series_data = saved_data
+                    return True
+                elif isinstance(data, list):
+                    # Backward compatibility: treat as list of completed links
+                    self.completed_links = set(data)
+                    return True
+                else:
+                    print(f"✗ Checkpoint file is invalid or corrupted.")
+                    return False
+            except Exception as e:
+                print(f"✗ Failed to load checkpoint: {e}")
+                return False
     
     def clear_checkpoint(self):
-        try:
-            if os.path.exists(self.checkpoint_file):
-                os.remove(self.checkpoint_file)
-        except OSError as e:
-            logger.debug(f"Could not remove checkpoint file: {e}")
+        """Clear checkpoint after successful completion (thread-safe)."""
+        with self._worker_lock:
+            try:
+                if os.path.exists(self.checkpoint_file):
+                    os.remove(self.checkpoint_file)
+            except OSError as e:
+                logger.debug(f"Could not remove checkpoint file: {e}")
 
     @staticmethod
     def get_checkpoint_mode(data_dir):
@@ -379,29 +433,31 @@ class BsToScraper:
             return None
     
     def save_failed_series(self):
-        """Persist failed series links for later retry (atomic write).
+        """Persist failed series links for later retry (atomic write, thread-safe).
         
         Merges with any existing failed series from previous runs so no
         failures are lost across multiple scraping sessions.
         """
         if not self.failed_links:
             return
-        try:
-            existing = self.load_failed_series()
-            # Merge: index existing by URL, then overlay with new failures
-            def _url_key(item):
-                if isinstance(item, dict):
-                    return item.get('url', item.get('link', ''))
-                return str(item)
-            merged = {_url_key(item): item for item in existing}
-            for item in self.failed_links:
-                merged[_url_key(item)] = item
-            self._atomic_write_json(self.failed_file, list(merged.values()))
-        except Exception as e:
-            logger.error(f"Failed to save failed series list: {e}")
-            print(f"  ⚠ Warning: could not save failed series list: {e}")
+        with self._worker_lock:
+            try:
+                existing = self._load_failed_series_unlocked()
+                # Merge: index existing by URL, then overlay with new failures
+                def _url_key(item):
+                    if isinstance(item, dict):
+                        return item.get('url', item.get('link', ''))
+                    return str(item)
+                merged = {_url_key(item): item for item in existing}
+                for item in self.failed_links:
+                    merged[_url_key(item)] = item
+                self._atomic_write_json(self.failed_file, list(merged.values()))
+            except Exception as e:
+                logger.error(f"Failed to save failed series list: {e}")
+                print(f"  ⚠ Warning: could not save failed series list: {e}")
     
-    def load_failed_series(self):
+    def _load_failed_series_unlocked(self):
+        """Internal: load failed series without locking (for use within locked context)."""
         try:
             with open(self.failed_file, 'r', encoding='utf-8') as f:
                 return json.load(f) or []
@@ -413,18 +469,30 @@ class BsToScraper:
         except Exception as e:
             logger.warning(f"Could not load failed series: {e}")
             return []
+
+    def load_failed_series(self):
+        """Load previously failed series for retry (thread-safe)."""
+        with self._worker_lock:
+            return self._load_failed_series_unlocked()
     
     def clear_failed_series(self):
-        try:
-            if os.path.exists(self.failed_file):
-                os.remove(self.failed_file)
-        except OSError as e:
-            logger.debug(f"Could not remove failed series file: {e}")
+        """Clear failed series list after successful retry (thread-safe)."""
+        with self._worker_lock:
+            try:
+                if os.path.exists(self.failed_file):
+                    os.remove(self.failed_file)
+            except OSError as e:
+                logger.debug(f"Could not remove failed series file: {e}")
     
     def is_pause_requested(self):
-        return os.path.exists(self.pause_file)
+        """Check if pause was requested (safe: only checks without side effects)."""
+        try:
+            return os.path.exists(self.pause_file)
+        except Exception:
+            return False
     
     def clear_pause_request(self):
+        """Remove pause request file (atomic, safe on Windows)."""
         try:
             if os.path.exists(self.pause_file):
                 os.remove(self.pause_file)
@@ -458,6 +526,17 @@ class BsToScraper:
             firefox_options.add_argument("--headless")
         firefox_options.add_argument("--disable-gpu")
         firefox_options.add_argument('--disable-blink-features=AutomationControlled')
+        
+        # Performance preferences — disable slow startup features
+        firefox_options.set_preference("startup.homepage_welcome_url", "")
+        firefox_options.set_preference("startup.homepage_welcome_url.additional", "")
+        firefox_options.set_preference("browser.startup.homepage_override.mstone", "ignore")
+        firefox_options.set_preference("browser.startup.homepage", "about:blank")
+        firefox_options.set_preference("browser.cache.check_doc_frequency", 0)  # Skip cache validation
+        firefox_options.set_preference("app.update.auto", False)  # No auto-update checks
+        firefox_options.set_preference("browser.sessionstore.max_tabs_undo", 0)  # Fast session restore
+        
+        # Ad/media blocking preferences
         firefox_options.set_preference("permissions.default.image", 1)
         firefox_options.set_preference("media.autoplay.default", 1)
         firefox_options.set_preference("dom.ipc.processPrelaunch.enabled", False)
@@ -467,6 +546,48 @@ class BsToScraper:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"
         )
         return firefox_options
+    
+    def _get_ublock_xpi(self):
+        """Find uBlock Origin .xpi, using local copy or copying from Firefox profile."""
+        ublock_id = 'uBlock0@raymondhill.net.xpi'
+        addon_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'addons')
+        local_xpi = os.path.join(addon_dir, 'ublock_origin.xpi')
+        
+        if os.path.isfile(local_xpi):
+            return local_xpi
+        
+        # Search Firefox profiles for installed uBlock
+        profiles_dir = os.path.join(os.environ.get('APPDATA', ''), 'Mozilla', 'Firefox', 'Profiles')
+        if os.path.isdir(profiles_dir):
+            for profile in os.listdir(profiles_dir):
+                xpi_path = os.path.join(profiles_dir, profile, 'extensions', ublock_id)
+                if os.path.isfile(xpi_path):
+                    os.makedirs(addon_dir, exist_ok=True)
+                    shutil.copy2(xpi_path, local_xpi)
+                    print(f'✓ Copied uBlock Origin from Firefox profile: {profile}')
+                    return local_xpi
+        
+        # Download from Mozilla Add-ons as last resort
+        url = 'https://addons.mozilla.org/firefox/downloads/latest/ublock-origin/latest.xpi'
+        print('→ Downloading uBlock Origin from addons.mozilla.org...')
+        try:
+            os.makedirs(addon_dir, exist_ok=True)
+            urllib.request.urlretrieve(url, local_xpi)
+            print('✓ uBlock Origin downloaded')
+            return local_xpi
+        except Exception as e:
+            print(f'⚠ Failed to download uBlock Origin: {e}')
+            return None
+    
+    def _install_ublock(self, driver):
+        """Install uBlock Origin into a driver instance."""
+        xpi = self._get_ublock_xpi()
+        if xpi:
+            try:
+                driver.install_addon(xpi, temporary=True)
+                time.sleep(self.get_timing_float('addon_init_delay', 0.1))
+            except Exception as e:
+                logger.debug(f'Failed to install uBlock Origin: {e}')
     
     def _build_firefox_service(self):
         """Build Firefox service, preferring local geckodriver if available."""
@@ -486,6 +607,9 @@ class BsToScraper:
                 self.save_worker_pid(0, firefox_service.process.pid)  # worker_id=0 for main driver
         except Exception:
             pass
+        
+        # Install uBlock Origin for ad-blocking (faster page loads)
+        self._install_ublock(self.driver)
     
     def close(self):
         if self.driver:
@@ -498,65 +622,42 @@ class BsToScraper:
     # ==================== AUTHENTICATION ====================
     
     def login(self, driver=None):
-        """Login to bs.to using config-based selectors."""
+        """Login to bs.to using JS injection.
+        
+        Targets the main #login-captcha form on /login page.
+        Falls back to header #login form if main form not found.
+        """
         drv = driver or self.driver
         try:
-            login_config = self.get_selector('login')
-            if not login_config:
-                raise Exception("Login config not found in selectors_config.json")
-            
             login_page = self.get_login_page()
             if drv is self.driver:
                 print(f"→ Navigating to login page: {login_page}")
             drv.get(login_page)
+            self._wait_for_page_ready(drv, timeout=self.get_timing_float('login_page_ready_timeout', 5.0))
             
-            # Wait for login form to appear
-            self.wait_for_css_element(drv, "input[type='submit'], button[type='submit']", timeout=3)
+            # Grab a reference to an element on the current page before submit
+            old_html = drv.find_element(By.TAG_NAME, 'html')
+            
+            # Fill and submit via JS — targets #login-captcha (main form) or #login (header)
+            drv.execute_script("""
+                var form = document.getElementById('login-captcha') || document.getElementById('login');
+                if (!form) throw new Error('Login form not found');
+                var user = form.querySelector("input[name='login[user]']");
+                var pass = form.querySelector("input[name='login[pass]']");
+                if (!user || !pass) throw new Error('Login fields not found');
+                user.value = arguments[0];
+                pass.value = arguments[1];
+                form.submit();
+            """, USERNAME, PASSWORD)
 
-            # Username field
-            username_field = self.find_element_from_config(
-                drv, 
-                login_config.get('username_field', []),
-                timeout=3
-            )
-            if not username_field:
-                raise Exception("Username field not found")
-            username_field.send_keys(USERNAME)
-
-            # Password field
-            password_field = self.find_element_from_config(
-                drv,
-                login_config.get('password_field', []),
-                timeout=3
-            )
-            if not password_field:
-                raise Exception("Password field not found")
-            password_field.send_keys(PASSWORD)
-
-            # Submit button
-            submit_button = self.find_element_from_config(
-                drv,
-                login_config.get('submit_button', []),
-                timeout=2
-            )
-
-            if drv is self.driver:
-                print("→ Submitting login...")
-            if submit_button:
-                submit_button.click()
-            else:
-                password_field.send_keys("\n")
-
-            # Wait for redirect
+            # Wait for the page to reload (old element becomes stale)
             try:
-                WebDriverWait(drv, TIMEOUT).until(
-                    lambda d: d.current_url != login_page
-                )
+                WebDriverWait(drv, self.get_timing_float('login_response_timeout', 10.0)).until(EC.staleness_of(old_html))
             except Exception:
                 pass
-
-            self.wait_for_css_element(drv, "body", timeout=3)
-            time.sleep(self.get_timing('login_delay'))
+            
+            # Wait for login response (bs.to stays on /login URL but renders home page)
+            self._wait_for_page_ready(drv, timeout=self.get_timing_float('login_response_timeout', 10.0))
             
             # Verify login
             if self.is_logged_in(drv):
@@ -591,7 +692,7 @@ class BsToScraper:
             all_series_url = f"{site_url}{series_page}"
             
             self.driver.get(all_series_url)
-            time.sleep(self.get_timing('page_load_delay'))
+            self._wait_for_page_ready(self.driver)
             
             page_content = self.driver.page_source
             soup = BeautifulSoup(page_content, 'html.parser')
@@ -674,43 +775,57 @@ class BsToScraper:
 
         site_url = self.get_site_url()
         for elem in season_elems:
-            label = elem.get_text(strip=True)
-            href = elem.get('href', '')
-            
-            # If href contains the series slug (serie/SeriesName/...), extract just the season/language part
-            # href format: "serie/Breaking-Bad/0/de" → we want "0/de"
-            if href.startswith('serie/'):
-                parts = href.split('/')
-                if len(parts) >= 3:
-                    # Skip "serie" and series name, keep season number and language
-                    href = '/'.join(parts[2:])
-            
-            classes = elem.get('class', [])
-            if isinstance(classes, str):
-                classes = classes.split()
+            try:
+                label = elem.get_text(strip=True)
+                if not label:  # Skip elements with no text
+                    continue
+                
+                href = elem.get('href', '')
+                if not href:  # Skip elements with no href
+                    continue
+                
+                # Strip query strings and fragments from href
+                href = href.split('?')[0].split('#')[0]
+                
+                # If href contains the series slug (serie/SeriesName/...), extract just the season/language part
+                # href format: "serie/Breaking-Bad/0/de" → we want "0/de"
+                if href.startswith('serie/'):
+                    parts = href.split('/')
+                    if len(parts) >= 3:
+                        # Skip "serie" and series name, keep season number and language
+                        href = '/'.join(parts[2:])
+                
+                classes = elem.get('class', [])
+                if isinstance(classes, str):
+                    classes = classes.split()
+                elif not classes:
+                    classes = []
 
-            if full_watched_class and full_watched_class in classes:
-                watched_status = 'full'  # All episodes watched (green) - skip loading
-            else:
-                watched_status = 'none'
+                if full_watched_class and full_watched_class in classes:
+                    watched_status = 'full'  # All episodes watched (green) - skip loading
+                else:
+                    watched_status = 'none'
 
-            # Tag season type: 'regular' or special label
-            if is_regular_season(label):
-                season_type_val = 'regular'
-            else:
-                season_type_val = label
+                # Tag season type: 'regular' or special label
+                if is_regular_season(label):
+                    season_type_val = 'regular'
+                else:
+                    season_type_val = label
 
-            # Build correct season URL using urljoin (handles all cases)
-            if href.startswith('http'):
-                season_url = href
-            elif href:
-                # Ensure base_url ends with / so urljoin treats it as a directory
-                base_with_slash = base_url if base_url.endswith('/') else base_url + '/'
-                season_url = urljoin(base_with_slash, href)
-            else:
-                season_url = base_url
+                # Build correct season URL using urljoin (handles all cases)
+                if href.startswith('http'):
+                    season_url = href
+                elif href:
+                    # Ensure base_url ends with / so urljoin treats it as a directory
+                    base_with_slash = base_url if base_url.endswith('/') else base_url + '/'
+                    season_url = urljoin(base_with_slash, href)
+                else:
+                    season_url = base_url
 
-            season_links.append((label, season_url, watched_status, season_type_val))
+                season_links.append((label, season_url, watched_status, season_type_val))
+            except Exception:
+                # Skip any malformed season elements
+                continue
 
         # Deduplicate seasons while preserving order
         seen = set()
@@ -726,29 +841,47 @@ class BsToScraper:
     # ==================== EPISODE SCRAPING ====================
     
     def scrape_episodes_from_html(self, html):
-        """Parse episodes table and return list of {number, title, watched}."""
+        """Parse episodes table and return list of {number, title, watched}.
+        Handles missing fields, None values, and malformed rows robustly.
+        """
         soup = BeautifulSoup(html, 'html.parser')
         episodes = []
         
         episode_config = self.get_selector('episodes')
-        if not episode_config:
+        if not episode_config or not isinstance(episode_config, dict):
             return episodes
         
         table_config = episode_config.get('table', {})
+        if not isinstance(table_config, dict):
+            return episodes
+            
         table_type = table_config.get('type', 'css')
         table_value = table_config.get('value')
         
-        if table_type == 'css':
-            table = soup.select_one(table_value)
-        else:
-            table = soup.find(table_value)
+        # Validate selector value exists and is non-empty
+        if not table_value:
+            return episodes
         
-        if table:
+        try:
+            if table_type == 'css':
+                table = soup.select_one(str(table_value))
+            else:
+                table = soup.find(str(table_value))
+        except Exception:
+            return episodes
+        
+        if not table:
+            return episodes
+        
+        try:
             row_config = episode_config.get('table_rows', {})
             row_type = row_config.get('type', 'css')
             row_value = row_config.get('value')
             
-            rows = table.select(row_value) if row_type == 'css' else table.find_all('tr')
+            if row_value:
+                rows = table.select(str(row_value)) if row_type == 'css' else table.find_all(str(row_value))
+            else:
+                rows = table.find_all('tr')
             
             watched_indicator = episode_config.get('watched_indicator', {})
             indicator_type = watched_indicator.get('type', 'row_class')
@@ -758,28 +891,42 @@ class BsToScraper:
             ep_title_cell = episode_config.get('episode_title_cell', 1)
             ep_title_selector = episode_config.get('episode_title_selector', 'strong')
             
+            # Validate cell indices are non-negative
+            if ep_num_cell < 0 or ep_title_cell < 0:
+                return episodes
+            
             for row in rows:
-                cols = row.find_all('td')
-                if len(cols) > max(ep_num_cell, ep_title_cell):
+                try:
+                    cols = row.find_all('td')
+                    if not cols or len(cols) <= max(ep_num_cell, ep_title_cell):
+                        continue
+                    
                     ep_num = cols[ep_num_cell].get_text(strip=True)
+                    if not ep_num:  # Skip empty episode numbers
+                        continue
                     
                     title_col = cols[ep_title_cell]
-                    title_tag = title_col.find(ep_title_selector)
+                    title_tag = title_col.find(ep_title_selector) if ep_title_selector else None
                     title = title_tag.get_text(strip=True) if title_tag else ''
                     
-                    # Detect watched status
+                    # Detect watched status (safe against missing/None values)
                     watched = False
                     if indicator_type == 'row_class':
                         row_classes = row.get('class', [])
                         if isinstance(row_classes, str):
                             row_classes = row_classes.split()
-                        watched = indicator_value in row_classes
+                        watched = bool(indicator_value and indicator_value in row_classes)
                     
                     episodes.append({
-                        'number': ep_num,
-                        'title': title,
-                        'watched': watched
+                        'number': str(ep_num),  # Ensure string type
+                        'title': str(title) if title else '',
+                        'watched': bool(watched)  # Ensure bool type
                     })
+                except Exception:
+                    # Skip malformed rows
+                    continue
+        except Exception:
+            pass  # Return whatever episodes were parsed before error
         
         return episodes
     
@@ -800,32 +947,68 @@ class BsToScraper:
         return self._process_series(self.driver, url, series_hint=series_hint)
     
     def extract_series_title(self, html):
-        """Extract series title from HTML using config selectors."""
+        """Extract series title from HTML using config selectors with fallbacks.
+        
+        Tries config selectors first, then falls back to common title patterns.
+        Returns title string or None if extraction fails completely.
+        """
+        if not html:
+            return None
+        
         soup = BeautifulSoup(html, 'html.parser')
         
         series_config = self.get_selector('series_page')
-        if not series_config:
-            return None
-        
-        title_config = series_config.get('title', {})
-        title_type = title_config.get('type', 'tag')
-        title_value = title_config.get('value', 'h2')
-        
-        try:
-            if title_type == 'tag':
-                element = soup.find(title_value)
-            else:
-                element = soup.select_one(title_value)
-            
-            if element:
-                main_text = element.get_text(strip=True)
-                if element.small:
-                    small_text = element.small.get_text(strip=True)
-                    main_text = main_text.replace(small_text, "").strip()
+        if series_config and isinstance(series_config, dict):
+            title_config = series_config.get('title', {})
+            if isinstance(title_config, dict):
+                title_type = title_config.get('type', 'tag')
+                title_value = title_config.get('value', 'h2')
                 
-                return main_text if main_text else None
-        except Exception:
-            pass
+                try:
+                    if title_value:
+                        if title_type == 'tag':
+                            element = soup.find(title_value)
+                        else:
+                            element = soup.select_one(str(title_value))
+                        
+                        if element:
+                            main_text = element.get_text(strip=True)
+                            # Remove subtitle if present (often in <small> tag)
+                            small_elem = element.find('small')
+                            if small_elem:
+                                small_text = small_elem.get_text(strip=True)
+                                main_text = main_text.replace(small_text, "").strip()
+                            
+                            if main_text:
+                                return main_text
+                except Exception as e:
+                    logger.debug(f"Config-based title extraction failed: {e}")
+        
+        # Fallback: try common title patterns
+        try:
+            # Try h1, h2, h3 tags in order
+            for tag in ['h1', 'h2', 'h3']:
+                element = soup.find(tag)
+                if element:
+                    text = element.get_text(strip=True)
+                    if text and len(text) > 2:  # Avoid very short titles
+                        return text
+            
+            # Try meta tags as last resort
+            og_title = soup.find('meta', property='og:title')
+            if og_title and og_title.get('content'):
+                return og_title.get('content').strip()
+            
+            title_tag = soup.find('title')
+            if title_tag:
+                text = title_tag.get_text(strip=True)
+                # Remove common site prefixes (e.g., "bs.to | Series Name")
+                if '|' in text:
+                    text = text.split('|', 1)[1].strip()
+                if text and len(text) > 2:
+                    return text
+        except Exception as e:
+            logger.debug(f"Fallback title extraction failed: {e}")
         
         return None
     
@@ -836,8 +1019,8 @@ class BsToScraper:
         """
         try:
             driver.get(url)
-            self.wait_for_css_element(driver, "body", timeout=10)
-            self.wait_for_css_element(driver, "h2", timeout=10, silent=True)
+            self._wait_for_page_ready(driver)
+            self.wait_for_css_element(driver, "#seasons", timeout=self.get_timing_float('season_nav_timeout', 10.0), silent=True)
 
             page_content = driver.page_source
 
@@ -861,7 +1044,6 @@ class BsToScraper:
                     'total_episodes': 0,
                     'watched_episodes': 0,
                     'seasons': [],
-                    'error': error_found,
                     'empty': True
                 }
 
@@ -895,17 +1077,18 @@ class BsToScraper:
                 season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
-                    max_retries = int(self.get_timing('max_retries_season') or 0) or 3
+                    max_retries = self._season_max_retries
                     episodes = []
                     season_failed = True
                     
                     for attempt in range(max_retries):
                         try:
                             driver.get(season_url)
-                            time.sleep(self.get_timing('season_load_delay'))
-                            self.wait_for_css_element(driver, "body", timeout=10)
+                            # Wait for the season page to finish loading before parsing.
+                            self._wait_for_page_ready(driver, timeout=self.get_timing_float('season_page_ready_timeout', 5.0))
+                            # Use a fixed timeout for the episodes table.
                             silent = attempt < max_retries - 1
-                            if self.wait_for_css_element(driver, "table.episodes", timeout=20 + attempt * 5, silent=silent):
+                            if self.wait_for_css_element(driver, "table.episodes", timeout=self.get_timing_float('episodes_table_timeout', 8.0), silent=silent):
                                 season_html = driver.page_source
                                 episodes = self.scrape_episodes_from_html(season_html)
                                 season_failed = False
@@ -913,11 +1096,9 @@ class BsToScraper:
                             else:
                                 if attempt < max_retries - 1:
                                     print(f"⚠ Retrying season {season_label} (attempt {attempt + 2}/{max_retries})")
-                                    time.sleep(2)
                         except Exception as inner_e:
                             if attempt < max_retries - 1:
                                 print(f"⚠ Error loading season {season_label}, retrying (attempt {attempt + 2}/{max_retries}): {inner_e}")
-                                time.sleep(2)
                             else:
                                 print(f"✗ Failed to load season {season_label} after {max_retries} attempts: {inner_e}")
                     
@@ -938,6 +1119,13 @@ class BsToScraper:
                 except Exception as e:
                     continue
 
+            # Ensure title exists or use fallback
+            if not title_value:
+                title_value = series_hint.get('title') if series_hint else None
+            if not title_value:
+                # Ultimate fallback: extract from URL
+                title_value = url.split('/')[-1] or 'Unknown Series'
+            
             # Robust link assignment
             link = None
             if series_hint and series_hint.get('link'):
@@ -952,13 +1140,20 @@ class BsToScraper:
             if not link.startswith('/'):
                 link = '/' + link
 
+            # Safe calculation of episode counts (handle edge cases)
+            total_eps = max(0, total_eps)  # Never negative
+            total_watched = min(total_watched, total_eps)  # Watched can't exceed total
+            unwatched = max(0, total_eps - total_watched)  # Never negative
+
             return {
-                "title": title_value or (series_hint.get('title') if series_hint else url),
+                "title": str(title_value),  # Ensure string
                 "link": link,
                 "url": url,
-                "seasons": seasons_data,
+                "total_seasons": len(seasons_data),
+                "total_episodes": total_eps,
                 "watched_episodes": total_watched,
-                "total_episodes": total_eps
+                "unwatched_episodes": unwatched,
+                "seasons": seasons_data
             }
         except Exception as e:
             raise Exception(f"Series processing failed for {url}: {str(e)}")
@@ -968,8 +1163,8 @@ class BsToScraper:
     def scrape_series_list(self):
         """Scrape all series in sequential or parallel mode."""
         try:
-            # Initial delay
-            time.sleep(self.get_timing('initial_delay'))
+            # Brief initial delay
+            time.sleep(self.get_timing_float('initial_delay', 0.3))
             
             all_series = self.get_all_series()
 
@@ -1008,10 +1203,14 @@ class BsToScraper:
         start_time = time.time()
         try:
             for idx, series in enumerate(all_series, 1):
+                # Check for pause request
+                if self.is_pause_requested():
+                    break
+
                 try:
                     # Calculate progress and ETA
                     elapsed = time.time() - start_time
-                    avg_time_per_series = elapsed / idx
+                    avg_time_per_series = elapsed / (idx - 1) if idx > 1 else 0
                     remaining_series = len(all_series) - idx
                     eta_seconds = avg_time_per_series * remaining_series
                     eta_mins = int(eta_seconds / 60)
@@ -1044,12 +1243,18 @@ class BsToScraper:
                     print(f"  ⚠ Error processing {series['title']}: {str(e)}")
                     self.failed_links.append(series)
                     continue
-        except KeyboardInterrupt:
-            print("\n\n⚠ Scraping interrupted by user (Ctrl+C)")
-            print(f"✓ Progress saved: {len(self.series_data)}/{len(all_series)} series scraped")
-            print("→ Use 'Resume from checkpoint' option to continue later\n")
-            return
+        except (KeyboardInterrupt, SystemExit):
+            print(f"\n⚠ Ctrl+C — saving {len(self.series_data)}/{len(all_series)} scraped series...")
+            raise
         
+        # Check if pause was requested — raise to trigger checkpoint save in run()
+        if self.is_pause_requested():
+            self.clear_pause_request()
+            print(f"\n⏸ Scraping paused by user")
+            print(f"✓ Progress saved: {len(self.series_data)}/{len(all_series)} series scraped")
+            print(f"→ Resume later with checkpoint option\n")
+            raise ScrapingPaused(f"{len(self.series_data)}/{len(all_series)} series scraped")
+
         # Save failed series for later retry (sequential mode)
         if self.failed_links:
             self.save_failed_series()
@@ -1117,19 +1322,11 @@ class BsToScraper:
                 logger.error(f"Worker #{worker_id}: failed to create driver: {e}")
                 print(f"  ✗ Worker #{worker_id}: Failed to create browser: {str(e)[:80]}")
                 return
-            success_delay = self.get_timing('success_delay') or 0.2
-            backoff_base = self.get_timing('error_backoff_base') or 0.5
-            backoff_max = self.get_timing('error_backoff_max') or 5.0
-            health_every_val = self.get_timing('health_check_every') or 10
-            restart_threshold_val = self.get_timing('error_restart_threshold') or 5
-            try:
-                health_every = int(health_every_val) if health_every_val and health_every_val >= 1 else 10
-            except Exception:
-                health_every = 10
-            try:
-                restart_threshold = int(restart_threshold_val) if restart_threshold_val and restart_threshold_val >= 2 else 5
-            except Exception:
-                restart_threshold = 5
+            success_delay = self.get_timing_float('success_delay', 0.15)
+            backoff_base = self.get_timing_float('error_backoff_base', 1.0)
+            backoff_max = self.get_timing_float('error_backoff_max', 8.0)
+            health_every = self.get_timing_int('health_check_every', 10)
+            restart_threshold = self.get_timing_int('error_restart_threshold', 5)
 
             error_streak = 0
             tasks_since_check = 0
@@ -1137,6 +1334,8 @@ class BsToScraper:
             # Share auth cookies from main driver
             authenticated = False
             max_auth_retries = 3
+            auth_page_delay = self.get_timing_float('worker_auth_page_delay', 1.0)
+            auth_retry_delay = self.get_timing_float('worker_auth_retry_delay', 1.0)
             for attempt in range(max_auth_retries):
                 try:
                     if self._apply_cookies_to_driver(driver) and self.is_logged_in(driver):
@@ -1146,16 +1345,16 @@ class BsToScraper:
                         # Cookie sharing failed, fall back to full login
                         self.login(driver)
                         driver.get(self.get_site_url())
-                        time.sleep(1.0)
+                        time.sleep(auth_page_delay)
                         if self.is_logged_in(driver):
                             authenticated = True
                             break
                         else:
                             print(f"  ⚠ Worker #{worker_id}: Login verification failed (try {attempt + 1}/{max_auth_retries})")
-                            time.sleep(1)
+                            time.sleep(auth_retry_delay)
                 except Exception as e:
                     print(f"  ⚠ Worker #{worker_id}: Auth failed - {str(e)[:80]}")
-                    time.sleep(1)
+                    time.sleep(auth_retry_delay)
                     continue
             
             if not authenticated:
@@ -1223,7 +1422,7 @@ class BsToScraper:
                         jitter = random.uniform(0, 0.3)
                         time.sleep(backoff + jitter)
                     except Exception:
-                        time.sleep(0.5)
+                        time.sleep(self.get_timing_float('error_backoff_fallback', 0.5))
 
                 do_health_check = (tasks_since_check >= health_every) or (error_streak >= 3)
                 if do_health_check:
@@ -1273,13 +1472,9 @@ class BsToScraper:
             # Wait for all workers to complete
             for f in as_completed(futures):
                 pass
-        except KeyboardInterrupt:
-            print("\n\n⚠ Scraping interrupted by user (Ctrl+C)")
-            print(f"✓ Progress saved: {len(self.series_data)}/{total_series} series scraped")
-            print("→ Use 'Resume from checkpoint' option to continue later\n")
-            stop_event.set()
-            executor.shutdown(wait=False, cancel_futures=True)
-            return
+        except (KeyboardInterrupt, SystemExit):
+            print(f"\n⚠ Ctrl+C — saving {len(self.series_data)}/{total_series} scraped series...")
+            raise
         finally:
             stop_event.set()
             executor.shutdown(wait=True, cancel_futures=False)
@@ -1307,10 +1502,11 @@ class BsToScraper:
 
         # Check if pause was requested
         if self.is_pause_requested():
+            self.clear_pause_request()
             print(f"\n⏸ Scraping paused by user")
             print(f"✓ Progress saved: {len(self.series_data)}/{total_series} series scraped")
-            print(f"→ Resume later with checkpoint option or use 'Retry failed' for errors\n")
-            self.clear_pause_request()
+            print(f"→ Resume later with checkpoint option\n")
+            raise ScrapingPaused(f"{len(self.series_data)}/{total_series} series scraped")
         
         # Save failed series for later retry
         if self.failed_links:
@@ -1326,40 +1522,69 @@ class BsToScraper:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
 
     def _create_worker_driver(self, worker_id=None):
-        """Create a new worker WebDriver and track its PID."""
-        firefox_options = self._build_firefox_options()
-        service = self._build_firefox_service()
+        """Create a new worker WebDriver and track its PID.
         
-        driver = webdriver.Firefox(service=service, options=firefox_options)
-        
-        # Track geckodriver PID from service if available (with retry)
-        if worker_id is not None:
-            pid_saved = False
-            for attempt in range(3):
+        Args:
+            worker_id: Optional worker ID for tracking
+            
+        Returns:
+            WebDriver instance or None if creation fails
+            
+        Raises:
+            Exception: If driver creation fails after retries
+        """
+        driver = None
+        try:
+            firefox_options = self._build_firefox_options()
+            service = self._build_firefox_service()
+            
+            driver = webdriver.Firefox(service=service, options=firefox_options)
+            
+            # Install uBlock Origin for ad-blocking
+            try:
+                self._install_ublock(driver)
+            except Exception as e:
+                logger.debug(f"Failed to install uBlock Origin: {e}")
+                # Continue anyway, uBlock is optional
+            
+            # Track geckodriver PID from service if available (with retry)
+            if worker_id is not None:
+                pid_saved = False
+                for attempt in range(3):
+                    try:
+                        if hasattr(service, 'process') and service.process:
+                            pid = service.process.pid
+                            if pid:
+                                self.save_worker_pid(worker_id, pid)
+                                pid_saved = True
+                                break
+                    except Exception:
+                        pass
+                    if not pid_saved and attempt < 2:
+                        time.sleep(self.get_timing_float('worker_service_init_delay', 0.1))
+                
+                if not pid_saved:
+                    logger.debug(f"Worker #{worker_id}: Could not track PID")
+            
+            return driver
+        except Exception as e:
+            # Clean up any partial driver created before error
+            if driver:
                 try:
-                    if hasattr(service, 'process') and service.process:
-                        pid = service.process.pid
-                        if pid:
-                            self.save_worker_pid(worker_id, pid)
-                            pid_saved = True
-                            break
+                    driver.quit()
                 except Exception:
                     pass
-                time.sleep(0.1)  # Brief delay for service to initialize
-            
-            if not pid_saved:
-                print(f"  ⚠ Worker #{worker_id}: Could not track PID")
-        
-        return driver
+            raise Exception(f"Failed to create worker driver: {str(e)}")
     
     def _apply_cookies_to_driver(self, driver):
         """Copy auth cookies to a worker driver (thread-safe snapshot)."""
-        cookies_snapshot = list(self.auth_cookies)
+        with self._worker_lock:
+            cookies_snapshot = list(self.auth_cookies)
         if not cookies_snapshot:
             return False
         try:
             driver.get(self.get_site_url())
-            time.sleep(self.get_timing('action_delay'))
+            self._wait_for_page_ready(driver, timeout=self.get_timing_float('cookie_apply_page_ready_timeout', 5.0))
             for cookie in cookies_snapshot:
                 try:
                     driver.add_cookie({
@@ -1425,7 +1650,7 @@ class BsToScraper:
     
     def scrape_new_series_only(self):
         """Scrape only series not yet in the index."""
-        time.sleep(self.get_timing('initial_delay'))
+        time.sleep(self.get_timing_float('initial_delay', 0.3))
         
         all_series = self.get_all_series()
         existing_slugs = self.load_existing_slugs()
@@ -1443,7 +1668,7 @@ class BsToScraper:
         self._scrape_series_sequential(new_series_list)
     
     def scrape_retry_failed(self):
-        """Retry previously failed series in sequential mode."""
+        """Retry previously failed series in sequential mode with higher retry count."""
         failed_list = self.load_failed_series()
         if not failed_list:
             print("✓ No failed series found")
@@ -1452,13 +1677,15 @@ class BsToScraper:
         print(f"✓ Found {len(failed_list)} failed series from last run")
         print("→ Starting retry in sequential mode (for reliability)...")
         self.series_data = []
+        # Use higher retry count for retry mode
+        self._season_max_retries = self.get_timing_int('max_retries_retry', 5)
     
         self._scrape_series_sequential(failed_list)
     # ==================== MAIN RUN METHODS ====================
     
     def scrape_single_series(self, url):
         """Scrape exactly one series by URL."""
-        time.sleep(self.get_timing('initial_delay'))
+        time.sleep(self.get_timing_float('initial_delay', 0.3))
         
         main_url = self.normalize_to_series_url(url)
         print(f"→ Scraping single series (normalized): {main_url}")
@@ -1467,10 +1694,9 @@ class BsToScraper:
         return result
     
     def scrape_multiple_series(self, urls):
-        """Scrape multiple series from a URL list (sequential)."""
-        time.sleep(self.get_timing('initial_delay'))
+        """Scrape multiple series from a URL list."""
+        time.sleep(self.get_timing_float('initial_delay', 0.3))
         
-        print(f"→ Scraping {len(urls)} series from URL list (sequential mode)...")
         # Normalize all URLs to main series page
         series_list = []
         for url in urls:
@@ -1479,7 +1705,12 @@ class BsToScraper:
             link_path = m.group(1) if m else main_url
             series_list.append({'title': main_url.split('/')[-1], 'link': link_path, 'url': main_url})
         self.series_data = []
-        self._scrape_series_sequential(series_list)
+        if self._use_parallel and len(series_list) > 1:
+            print(f"→ Scraping {len(urls)} series from URL list (parallel mode)...")
+            self._scrape_series_parallel(series_list)
+        else:
+            print(f"→ Scraping {len(urls)} series from URL list (sequential mode)...")
+            self._scrape_series_sequential(series_list)
         print(f"  Successfully scraped: {len(self.series_data)}/{len(urls)} series")
     
     def run(self, single_url=None, url_list=None, new_only=False, resume_only=False, retry_failed=False, parallel=None):
@@ -1520,12 +1751,19 @@ class BsToScraper:
                 self._checkpoint_mode = 'all_series'
                 self.scrape_series_list()
             
-            self.clear_checkpoint()
+            # Save checkpoint with data so caller can confirm save before clearing
+            self.save_checkpoint(include_data=True)
             # Only clear failed series file if no failures remain
             if not self.failed_links:
                 self.clear_failed_series()
             else:
                 self.save_failed_series()
+        except ScrapingPaused:
+            # Pause requested — save full checkpoint with data for resume
+            self.save_checkpoint(include_data=True)
+            if self.failed_links:
+                self.save_failed_series()
+            # Don't re-raise — let caller process whatever series_data we collected
         except BaseException:
             # Catches Exception, SystemExit (from SIGINT), KeyboardInterrupt
             # Save full checkpoint with series_data so no progress is lost on resume

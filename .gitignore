@@ -37,19 +37,24 @@ wheels/
 # OS
 .DS_Store
 Thumbs.db
-
+/addons/
 
 # Logs
 *.log
 # User-specific series URLs
 series_urls.txt
 
-# Scraper pause/worker files
-/data/.pause_scraping
-/data/.failed_series.json
-/data/.worker_pids.json
+# Scraper data & state files (local runtime)
+/data/series_index.json        # Your series database (keep private)
+/data/.scrape_checkpoint.json  # Checkpoint resume state
+/data/.failed_series.json      # Failed series tracking
+/data/.pause_scraping          # Pause request flag
+
+# Logs (accumulate locally)
+/logs/
 /data/.scrape_checkpoint.json
 # Personal data files
 /data/series_index.json
 /data/series_report.json
 /watched.txt
+data/.worker_pids.json
