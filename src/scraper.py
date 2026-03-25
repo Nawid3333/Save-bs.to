@@ -1120,6 +1120,7 @@ class BsToScraper:
             seasons_data = []
             total_watched = 0
             total_eps = 0
+            max_retries = self._season_max_retries
 
             for idx, season_item in enumerate(season_links):
                 season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)

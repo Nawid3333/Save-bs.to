@@ -45,16 +45,9 @@ Thumbs.db
 series_urls.txt
 
 # Scraper data & state files (local runtime)
-/data/series_index.json        # Your series database (keep private)
-/data/.scrape_checkpoint.json  # Checkpoint resume state
-/data/.failed_series.json      # Failed series tracking
-/data/.pause_scraping          # Pause request flag
+/data/
 
 # Logs (accumulate locally)
 /logs/
-/data/.scrape_checkpoint.json
-# Personal data files
-/data/series_index.json
-/data/series_report.json
-/watched.txt
-data/.worker_pids.json
+
+# 
