@@ -38,7 +38,7 @@ from config.config import USERNAME, PASSWORD, HEADLESS, DATA_DIR, SERIES_INDEX_F
 logger = logging.getLogger(__name__)
 
 # Worker pool size — override via BS_MAX_WORKERS env var
-MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "16"))
+MAX_WORKERS = int(os.getenv("BS_MAX_WORKERS", "20"))
 USE_PARALLEL = True
 
 # Checkpoint frequency (save progress every N series)
