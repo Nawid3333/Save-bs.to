@@ -229,6 +229,39 @@ class BsToScraper:
     def get_site_url(self):
         return self.config.get('site_url', 'https://bs.to')
     
+    def _is_driver_alive(self, driver=None):
+        """Check if a WebDriver session is still usable."""
+        drv = driver or self.driver
+        if drv is None:
+            return False
+        try:
+            _ = drv.current_url
+            return True
+        except Exception:
+            return False
+
+    def _has_auth_cookies(self, driver):
+        """Lightweight auth check: verify session cookies exist without page navigation.
+
+        Much faster than is_logged_in() which loads the page. Use for periodic
+        health checks; reserve is_logged_in() for error recovery.
+
+        Returns:
+            bool: True if session cookies are present
+        """
+        try:
+            cookies = driver.get_cookies()
+            cookie_names = {c['name'] for c in cookies}
+            session_indicators = {'session', 'PHPSESSID', 'laravel_session', 'remember_web', 'XSRF-TOKEN'}
+            if cookie_names & session_indicators:
+                return True
+            # Fallback: if we have 2+ cookies on the bs.to domain, session is likely alive
+            site_domain = urlparse(self.get_site_url()).hostname
+            domain_cookies = [c for c in cookies if site_domain in (c.get('domain', '') or '')]
+            return len(domain_cookies) >= 2
+        except Exception:
+            return False
+
     def is_logged_in(self, driver):
         """Check if authenticated by looking for the logout link in the navigation section."""
         try:
@@ -1092,9 +1125,13 @@ class BsToScraper:
                 season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
-                    max_retries = self._season_max_retries
-                    episodes = []
-                    season_failed = True
+                # Per-season auth check: catch session expiry before navigating
+                if not self._has_auth_cookies(driver):
+                    if not self.is_logged_in(driver):
+                        logger.warning(f"Session expired before season {season_label} of {url} — re-authenticating")
+                        if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
+                            self.login(driver)
+
                     
                     for attempt in range(max_retries):
                         try:
@@ -1419,6 +1456,29 @@ class BsToScraper:
                             progress_line(completed, total_series, series.get('title', 'Series'), error='skipped', worker_id=worker_id)
                             error_streak += 1
                 except Exception as e:
+                    if not self._is_driver_alive(driver):
+                        # Driver was killed externally — restart it and re-queue item
+                        logger.warning(f"Worker #{worker_id}: Driver died during scrape — restarting")
+                        print(f"  ⚠ Worker #{worker_id}: Browser crashed — restarting...")
+                        try:
+                            work_queue.put(series)
+                        except Exception:
+                            pass
+                        try:
+                            driver.quit()
+                        except Exception:
+                            pass
+                        try:
+                            driver = self._create_worker_driver(worker_id)
+                            cookies_ok = self._apply_cookies_to_driver(driver)
+                            if not cookies_ok:
+                                self.login(driver)
+                            error_streak = 0
+                            print(f"  ✓ Worker #{worker_id}: Browser restarted")
+                        except Exception as restart_err:
+                            logger.error(f"Worker #{worker_id}: Failed to restart driver: {restart_err}")
+                            break
+                        continue
                     with lock:
                         failed += 1
                         self.failed_links.append(series)
@@ -1442,21 +1502,35 @@ class BsToScraper:
                 do_health_check = (tasks_since_check >= health_every) or (error_streak >= 3)
                 if do_health_check:
                     tasks_since_check = 0
-                    try:
-                        # Check login status on the current page first
-                        if not self.is_logged_in(driver):
-                            # Only reload main page if not logged in
-                            driver.get(self.get_site_url())
+                    if not self._is_driver_alive(driver):
+                        break
+                    if error_streak >= 3:
+                        # Error streak: full page-navigation check
+                        try:
                             if not self.is_logged_in(driver):
-                                try:
-                                    # Try cookies first, fall back to full login
-                                    if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
-                                        self.login(driver)
-                                    error_streak = 0
-                                except Exception:
-                                    error_streak += 1
-                    except Exception:
-                        error_streak += 1
+                                driver.get(self.get_site_url())
+                                if not self.is_logged_in(driver):
+                                    try:
+                                        if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
+                                            self.login(driver)
+                                        error_streak = 0
+                                    except Exception:
+                                        error_streak += 1
+                        except Exception:
+                            error_streak += 1
+                    else:
+                        # Routine check: lightweight cookie check (no page loads)
+                        if not self._has_auth_cookies(driver):
+                            try:
+                                if not self.is_logged_in(driver):
+                                    try:
+                                        if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
+                                            self.login(driver)
+                                        error_streak = 0
+                                    except Exception:
+                                        error_streak += 1
+                            except Exception:
+                                error_streak += 1
 
                 if error_streak >= restart_threshold:
                     try:
