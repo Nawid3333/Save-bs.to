@@ -1125,12 +1125,12 @@ class BsToScraper:
                 season_label, season_url, watched_status, season_type = self.parse_season_item(season_item)
 
                 try:
-                # Per-season auth check: catch session expiry before navigating
-                if not self._has_auth_cookies(driver):
-                    if not self.is_logged_in(driver):
-                        logger.warning(f"Session expired before season {season_label} of {url} — re-authenticating")
-                        if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
-                            self.login(driver)
+                    # Per-season auth check: catch session expiry before navigating
+                    if not self._has_auth_cookies(driver):
+                        if not self.is_logged_in(driver):
+                            logger.warning(f"Session expired before season {season_label} of {url} — re-authenticating")
+                            if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
+                                self.login(driver)
 
                     
                     for attempt in range(max_retries):
