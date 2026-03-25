@@ -173,9 +173,6 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
 
         return scraper
-    except OSError as e:
-        print(f"\n✗ Network error occurred: {str(e)}")
-        logger.error(f"Network error in {description}: {e}")
     except (KeyboardInterrupt, SystemExit):
         print(f"\n⚠ Scraping interrupted by Ctrl+C")
         if 'scraper' in locals() and scraper.series_data:
@@ -186,6 +183,9 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
             print(f"\n⚠ {len(scraper.failed_links)} series failed.")
             print("→ Use option 6 (Retry failed series) to rescrape these later.")
         return scraper if 'scraper' in locals() else None
+    except OSError as e:
+        print(f"\n✗ Network error occurred: {str(e)}")
+        logger.error(f"Network error in {description}: {e}")
     except Exception as e:
         print(f"\n✗ Unexpected error: {str(e)}")
         logger.error(f"Unexpected error in {description}: {e}")
@@ -472,58 +472,82 @@ def pause_scraping():
         logger.error(f"Failed to create pause file {pause_file}: {e}")
 
 def show_active_workers():
-    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
-    
-    if not os.path.exists(worker_pids_file):
+    try:
+        pid_files = [
+            os.path.join(DATA_DIR, f) for f in os.listdir(DATA_DIR)
+            if f.startswith('.worker_pids_') and f.endswith('.json')
+        ]
+    except OSError:
+        pid_files = []
+
+    if not pid_files:
         print("\n✓ No active workers found\n")
         return
-    
-    try:
-        with open(worker_pids_file, 'r', encoding='utf-8') as f:
-            workers = json.load(f)
-        if not isinstance(workers, dict) or not workers:
-            print("\n✓ No active workers\n")
-            return
-        print(f"\n📊 ACTIVE WORKERS ({len(workers)}):")
-        print("ID | PID | Type")
-        print("---|-----|------")
+
+    # Collect all workers across all instances
+    all_workers = {}   # { (owner_pid, worker_id): (pid, filepath) }
+    live_files = []
+    for fpath in pid_files:
         try:
-            for worker_id, pid in sorted(workers.items(), key=lambda x: int(x[0])):
-                worker_type = "Main" if worker_id == "0" else f"Worker"
-                print(f"{worker_id:>2} | {pid} | {worker_type}")
-        except Exception as e:
-            print("✗ Error parsing worker PIDs. File may be corrupted.")
-            logger.error(f"Error parsing worker PIDs: {e}")
-            return
-        print()
-        kill_choice = input("Kill all workers? (y/n): ").strip().lower()
-        if kill_choice == 'y':
-            print("\n🔴 Killing all workers...")
-            killed_count = 0
+            with open(fpath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                continue
+            owner_pid = data.get('_owner_pid', '?')
+            workers = {k: v for k, v in data.items() if k != '_owner_pid'}
+            if not workers:
+                continue
+            live_files.append(fpath)
             for worker_id, pid in workers.items():
-                try:
-                    if sys.platform == 'win32':
-                        subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'], 
-                                     capture_output=True, check=False)
-                    else:
-                        subprocess.run(['kill', '-9', str(pid)], 
-                                     capture_output=True, check=False)
-                    killed_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to kill worker {worker_id} (PID {pid}): {e}")
-            # Clean up the PID file
-            try:
-                os.remove(worker_pids_file)
-                print(f"✓ Killed {killed_count} worker(s) and cleaned up tracking file\n")
-                logger.info(f"Killed {killed_count} workers and cleaned up tracking file")
-            except Exception as e:
-                print(f"✓ Killed {killed_count} worker(s)\n")
-                logger.error(f"Failed to clean up worker PIDs file: {e}")
-        else:
-            print("✓ Workers left running\n")
+                all_workers[(str(owner_pid), str(worker_id))] = (pid, fpath)
+        except Exception as e:
+            logger.error(f"Error reading {fpath}: {e}")
+
+    if not all_workers:
+        print("\n✓ No active workers found\n")
+        return
+
+    print(f"\n📊 ACTIVE WORKERS ({len(all_workers)} across {len(live_files)} instance(s)):")
+    print("Instance PID | Worker ID | Worker PID | Type")
+    print("-------------|-----------|------------|-----")
+    try:
+        for (owner_pid, worker_id), (pid, _) in sorted(
+            all_workers.items(), key=lambda x: (x[0][0], int(x[0][1]))
+        ):
+            worker_type = "Main" if worker_id == "0" else "Worker"
+            print(f"{owner_pid:>12} | {worker_id:>9} | {pid:>10} | {worker_type}")
     except Exception as e:
-        print(f"\n✗ Error reading workers: {str(e)}")
-        logger.error(f"Error reading workers from file {worker_pids_file}: {e}")
+        print("✗ Error parsing worker PIDs. File may be corrupted.")
+        logger.error(f"Error parsing worker PIDs: {e}")
+        return
+    print()
+    kill_choice = input("Kill all workers? (y/n): ").strip().lower()
+    if kill_choice == 'y':
+        print("\n🔴 Killing all workers...")
+        killed_count = 0
+        for (owner_pid, worker_id), (pid, _) in all_workers.items():
+            try:
+                if sys.platform == 'win32':
+                    subprocess.run(['taskkill', '/F', '/PID', str(pid), '/T'],
+                                   capture_output=True, check=False)
+                else:
+                    subprocess.run(['kill', '-9', str(pid)],
+                                   capture_output=True, check=False)
+                killed_count += 1
+            except Exception as e:
+                logger.error(f"Failed to kill worker {worker_id} (PID {pid}): {e}")
+        # Remove all tracked PID files
+        removed_files = 0
+        for fpath in set(fp for _, (_, fp) in all_workers.items()):
+            try:
+                os.remove(fpath)
+                removed_files += 1
+            except Exception as e:
+                logger.error(f"Failed to clean up {fpath}: {e}")
+        print(f"✓ Killed {killed_count} worker(s) and cleaned up {removed_files} tracking file(s)\n")
+        logger.info(f"Killed {killed_count} workers and cleaned up {removed_files} tracking files")
+    else:
+        print("✓ Workers left running\n")
 
 
 def main():

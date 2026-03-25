@@ -125,6 +125,8 @@ Then run option 5.
 
 Run option 7 in a second terminal while a scrape is running. The script creates the `.pause_scraping` flag automatically — the running scraper detects it at the next series boundary, saves a checkpoint, and stops cleanly.
 
+> ⚠️ **One scraping instance at a time.** Only one terminal should run a scrape (options 1–3, 5, 6) at any given time. Running two simultaneous scrapes against the same `data/` folder will cause them to overwrite each other's checkpoint and series index. Use a second terminal **only** for option 7 (pause) or option 8 (show workers) — both are read-only or signal-only operations that are safe to run alongside a live scrape.
+
 ---
 
 ## Architecture
@@ -145,13 +147,13 @@ main.py
 
 **Hidden runtime files** (in `data/`):
 
-| File                      | Purpose                                          |
-| ------------------------- | ------------------------------------------------ |
-| `series_index.json`       | Main series database                             |
-| `.scrape_checkpoint.json` | Completed slugs + full scraped data (for resume) |
-| `.failed_series.json`     | Series that errored (for option 6 retry)         |
-| `.worker_pids.json`       | Geckodriver PIDs (cleaned up on exit)            |
-| `.pause_scraping`         | Pause flag file (created by option 7)            |
+| File                      | Purpose                                                                  |
+| ------------------------- | ------------------------------------------------------------------------ |
+| `series_index.json`       | Main series database                                                     |
+| `.scrape_checkpoint.json` | Completed slugs + full scraped data (for resume)                         |
+| `.failed_series.json`     | Series that errored (for option 6 retry)                                 |
+| `.worker_pids_<pid>.json` | Geckodriver PIDs for this process (auto-cleaned on exit or next startup) |
+| `.pause_scraping`         | Pause flag file (created by option 7)                                    |
 
 ---
 
@@ -301,6 +303,12 @@ bs.to-scraper/
 - bs.to likely changed their HTML structure
 - Open browser dev tools (F12), inspect the broken element
 - Update the matching selector in `config/selectors_config.json`
+
+**Stale `.worker_pids_<pid>.json` file after a hard kill**
+
+- If you close the terminal window while a scrape is running, geckodriver processes may linger briefly
+- On the **next startup**, stale PID files are detected automatically, orphaned processes are killed, and the files are removed — no manual action needed
+- If you need to clean up immediately, use option 8 → kill all workers
 
 **Corrupted database**
 

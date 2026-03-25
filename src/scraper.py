@@ -61,7 +61,8 @@ def _is_pid_alive(pid):
         if sys.platform == 'win32':
             result = subprocess.run(
                 ['tasklist', '/FI', f'PID eq {pid}', '/NH'],
-                capture_output=True, check=False, text=True
+                capture_output=True, check=False, text=True,
+                encoding='utf-8', errors='replace'
             )
             return str(pid) in result.stdout
         else:
@@ -71,58 +72,71 @@ def _is_pid_alive(pid):
         return False
 
 
-def cleanup_stale_worker_pids():
-    """Remove .worker_pids.json if all tracked processes are dead (e.g. after a hard kill).
-    Called once on module startup to handle orphaned workers from previous runs."""
-    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
-    if not os.path.exists(worker_pids_file):
-        return
-    try:
-        with open(worker_pids_file, 'r') as f:
-            pids = json.load(f)
-        if not isinstance(pids, dict) or not pids:
-            os.remove(worker_pids_file)
-            return
-        # If any tracked PID is still alive, another instance may be running — don't interfere
-        if any(_is_pid_alive(pid) for pid in pids.values()):
-            return
-        # All PIDs are dead — safe to clean up the stale file
-        os.remove(worker_pids_file)
-    except Exception:
+def _kill_pids_in_file(pids_dict):
+    """Kill all geckodriver PIDs listed in a pids dict (skips _owner_pid)."""
+    for key, pid in pids_dict.items():
+        if key == '_owner_pid':
+            continue
         try:
-            os.remove(worker_pids_file)
+            if sys.platform == 'win32':
+                subprocess.run(
+                    ['taskkill', '/F', '/PID', str(pid), '/T'],
+                    capture_output=True, check=False
+                )
+            else:
+                subprocess.run(
+                    ['kill', '-9', str(pid)],
+                    capture_output=True, check=False
+                )
         except Exception:
             pass
+
+
+def cleanup_stale_worker_pids():
+    """Scan data/ for all per-process .worker_pids_<pid>.json files.
+    For each: if the owning Python process is dead, kill geckodriver orphans and remove the file.
+    Called once on module startup to handle orphaned workers from previous runs."""
+    try:
+        files = [
+            f for f in os.listdir(DATA_DIR)
+            if f.startswith('.worker_pids_') and f.endswith('.json')
+        ]
+    except OSError:
+        return
+    for fname in files:
+        fpath = os.path.join(DATA_DIR, fname)
+        try:
+            with open(fpath, 'r') as f:
+                pids = json.load(f)
+            if not isinstance(pids, dict):
+                os.remove(fpath)
+                continue
+            owner_pid = pids.get('_owner_pid')
+            if owner_pid and _is_pid_alive(owner_pid):
+                # Owning Python process is still alive — another live instance, don't interfere
+                continue
+            # Owner is dead — kill geckodriver orphans and clean up
+            _kill_pids_in_file(pids)
+            os.remove(fpath)
+        except Exception:
+            try:
+                os.remove(fpath)
+            except Exception:
+                pass
 
 
 def cleanup_geckodriver_processes():
-    """Kill geckodriver processes we spawned (tracked by PID file)."""
-    worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
-    if os.path.exists(worker_pids_file):
+    """Kill geckodriver processes we spawned (tracked by this process's own PID file)."""
+    if os.path.exists(_MY_PID_FILE):
         try:
-            with open(worker_pids_file, 'r') as f:
+            with open(_MY_PID_FILE, 'r') as f:
                 pids = json.load(f)
-            if not isinstance(pids, dict):
-                pids = {}
-            for worker_id, pid in pids.items():
-                try:
-                    if sys.platform == 'win32':
-                        subprocess.run(
-                            ['taskkill', '/F', '/PID', str(pid), '/T'],
-                            capture_output=True, check=False
-                        )
-                    else:
-                        subprocess.run(
-                            ['kill', '-9', str(pid)],
-                            capture_output=True, check=False
-                        )
-                except Exception:
-                    pass
+            if isinstance(pids, dict):
+                _kill_pids_in_file(pids)
         except Exception:
             pass
-        # Always remove the PID file after cleanup attempt
         try:
-            os.remove(worker_pids_file)
+            os.remove(_MY_PID_FILE)
         except Exception:
             pass
 
@@ -132,7 +146,10 @@ def _signal_handler(signum, frame):
     sys.exit(0)
 
 
-# Auto-clean stale PID file on startup (handles hard-killed terminals)
+# Per-process PID file — each running instance gets its own file so they don't stomp each other
+_MY_PID_FILE = os.path.join(DATA_DIR, f'.worker_pids_{os.getpid()}.json')
+
+# Auto-clean stale PID files on startup (handles hard-killed terminals)
 cleanup_stale_worker_pids()
 
 # Register cleanup handlers
@@ -162,7 +179,7 @@ class BsToScraper:
         self.checkpoint_file = os.path.join(DATA_DIR, '.scrape_checkpoint.json')
         self.failed_file = os.path.join(DATA_DIR, '.failed_series.json')
         self.pause_file = os.path.join(DATA_DIR, '.pause_scraping')
-        self.worker_pids_file = os.path.join(DATA_DIR, '.worker_pids.json')
+        self.worker_pids_file = _MY_PID_FILE
         self.completed_links = set()
         self.failed_links = []
         self.worker_pids = {}  # {worker_id: geckodriver_pid}
@@ -213,13 +230,9 @@ class BsToScraper:
         return self.config.get('site_url', 'https://bs.to')
     
     def is_logged_in(self, driver):
-        """Check if driver session is authenticated by looking for known markers."""
+        """Check if authenticated by looking for the logout link in the navigation section."""
         try:
-            page_html = driver.page_source.lower()
-            login_config = self.get_selector('login')
-            markers = login_config.get('verification_markers', ['logout', 'hallo']) if login_config else ['logout']
-            markers_to_check = [m.lower() for m in markers] + [USERNAME.lower()]
-            return any(token in page_html for token in markers_to_check)
+            return len(driver.find_elements(By.CSS_SELECTOR, 'section.navigation a[href="logout"]')) > 0
         except Exception:
             return False
     
@@ -504,7 +517,9 @@ class BsToScraper:
         with self._worker_lock:
             self.worker_pids[str(worker_id)] = pid
             try:
-                self._atomic_write_json(self.worker_pids_file, dict(self.worker_pids))
+                payload = {'_owner_pid': os.getpid()}
+                payload.update(self.worker_pids)
+                self._atomic_write_json(self.worker_pids_file, payload)
             except Exception as e:
                 logger.debug(f"Failed to save worker PID {worker_id}: {e}")
     
