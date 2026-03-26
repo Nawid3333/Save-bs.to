@@ -210,9 +210,12 @@ def scrape_series():
 
     print("\nScraping mode:")
     print("  1. Sequential (slower, but most reliable)")
-    print("  2. Parallel (faster, uses multiple workers)\n")
-    mode_choice = input("Choose mode (1-2) [default: 2]: ").strip() or '2'
+    print("  2. Parallel (faster, uses multiple workers)")
+    print("  0. Back\n")
+    mode_choice = input("Choose mode (0-2) [default: 2]: ").strip() or '2'
 
+    if mode_choice == '0':
+        return
     if mode_choice not in ['1', '2']:
         print("⚠ Invalid choice, using default (parallel)")
         use_parallel = True
@@ -246,14 +249,14 @@ def scrape_new_series():
 
 def add_series_by_url():
     print("\n→ Add single series by URL")
-    print("  Example: https://bs.to/serie/Breaking-Bad\n")
+    print("  Example: https://bs.to/serie/Breaking-Bad")
+    print("  0. Back\n")
     
     while True:
         url = input("Enter series URL: ").strip()
         # Validate URL format
-        if not url:
-            print("✗ No URL provided")
-            continue
+        if not url or url == '0':
+            return
         if not url.startswith(("http://", "https://")):
             print("✗ Invalid URL (must start with http:// or https://)")
             continue
@@ -391,10 +394,12 @@ def batch_add_series_from_file():
     print("  The file should contain one URL per line")
     print("  Example format:")
     print("    https://bs.to/serie/Breaking-Bad")
+    print("  (type 0 to go back)")
     
     default_file = os.path.join(os.path.dirname(__file__), 'series_urls.txt')
-    file_path = input(f"Enter file path [default: series_urls.txt]: ").strip().strip('"\'')
-    
+    file_path = input(f"Enter file path [default: series_urls.txt]: ").strip().strip("\"'")    
+    if file_path == '0':
+        return
     if not file_path:
         file_path = default_file
     
