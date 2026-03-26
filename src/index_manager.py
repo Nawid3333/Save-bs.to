@@ -199,6 +199,79 @@ def group_episodes_by_season(episode_list, new_data, prefix='[+]'):
     return result
 
 
+def _extract_slug(entry):
+    """Extract series slug from an index entry's link or url field.
+
+    Looks for '/serie/' in the value and returns the next path segment.
+    Returns None if extraction fails.
+    """
+    for field in ('link', 'url'):
+        value = entry.get(field, '') if isinstance(entry, dict) else ''
+        if not value or not isinstance(value, str):
+            continue
+        idx = value.find('/serie/')
+        if idx == -1:
+            continue
+        slug = value[idx + len('/serie/'):].strip('/').split('/')[0]
+        if slug:
+            return slug
+    return None
+
+
+def show_vanished_series(old_data, all_discovered_slugs, scrape_scope):
+    """Show informational notification about previously indexed series not found in the current scrape.
+
+    Purely informational — no index changes are made.
+
+    Args:
+        old_data: dict of old series index (title -> series dict)
+        all_discovered_slugs: set of slugs discovered in the current scrape
+        scrape_scope: str indicating scrape mode:
+            'all' / 'new_only' — full bs.to catalogue was fetched, show all vanished
+            None / other — suppress notification (partial scrape)
+
+    Returns:
+        list of vanished series titles, or empty list
+    """
+    if scrape_scope not in ('all', 'new_only'):
+        return []
+
+    vanished = []
+    corrupt_entries = []
+
+    for title, entry in old_data.items():
+        slug = _extract_slug(entry)
+        if slug is None:
+            corrupt_entries.append(title)
+            continue
+
+        if slug not in all_discovered_slugs:
+            vanished.append(title)
+
+    if corrupt_entries:
+        print(f"\n\u26a0 {len(corrupt_entries)} index entry(s) have corrupt/missing URL data:")
+        for t in corrupt_entries[:10]:
+            print(f"  \u2022 {t}")
+        if len(corrupt_entries) > 10:
+            print(f"  ... and {len(corrupt_entries) - 10} more")
+        print("  These entries were skipped during vanished-series detection.")
+        logger.warning(f"Corrupt URL data in {len(corrupt_entries)} index entries: {corrupt_entries[:5]}")
+
+    if vanished:
+        print(f"\n{'\u2500'*70}")
+        print(f"  [INFO] {len(vanished)} previously indexed series NOT found in current scrape:")
+        print(f"{'\u2500'*70}")
+        for title in vanished[:20]:
+            print(f"  \u2022 {title}  (not found on bs.to)")
+        if len(vanished) > 20:
+            print(f"  ... and {len(vanished) - 20} more")
+        print(f"{'\u2500'*70}")
+        print("  These series are preserved unchanged in the index.")
+        logger.info(f"Vanished series notification: {len(vanished)} series not found in scrape scope '{scrape_scope}'")
+
+    return vanished
+
+
 def detect_changes(old_data, new_data):
     """Detect changes between old and new data. Returns dict of change lists.
 

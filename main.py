@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from config.config import USERNAME, PASSWORD, DATA_DIR, LOG_FILE
 from src.scraper import BsToScraper
-from src.index_manager import IndexManager, confirm_and_save_changes
+from src.index_manager import IndexManager, confirm_and_save_changes, show_vanished_series
 
 # Logging
 logging.basicConfig(
@@ -162,6 +162,17 @@ def _run_scrape_and_save(run_kwargs, description, success_msg, no_data_msg):
         scraper.run(**run_kwargs)
 
         if scraper.series_data:
+            # Show vanished-series notification if full catalogue was fetched
+            if scraper.all_discovered_series is not None:
+                all_slugs = set()
+                for s in scraper.all_discovered_series:
+                    slug = scraper.get_series_slug_from_url(s.get('link', ''))
+                    if slug and slug != 'unknown':
+                        all_slugs.add(slug)
+                scope = 'new_only' if run_kwargs.get('new_only') else 'all'
+                index_manager = IndexManager()
+                show_vanished_series(index_manager.series_index, all_slugs, scope)
+
             if confirm_and_save_changes(scraper.series_data, description):
                 print(f"\n✓ {success_msg}")
                 print_scraped_series_status()

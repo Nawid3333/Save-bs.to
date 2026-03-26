@@ -196,6 +196,7 @@ class BsToScraper:
         self._season_max_retries = int(self.config.get('timing', {}).get('max_retries_season') or 0) or 3
         self._last_pause_check = 0.0
         self._pause_cached = False
+        self.all_discovered_series = None
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
@@ -1246,6 +1247,7 @@ class BsToScraper:
             time.sleep(self.get_timing_float('initial_delay', 0.3))
             
             all_series = self.get_all_series()
+            self.all_discovered_series = all_series
 
             if self._use_parallel:
                 print("→ Starting series scraping (parallel mode)...")
@@ -1775,6 +1777,7 @@ class BsToScraper:
         time.sleep(self.get_timing_float('initial_delay', 0.3))
         
         all_series = self.get_all_series()
+        self.all_discovered_series = all_series
         existing_slugs = self.load_existing_slugs()
 
         new_series_list = [s for s in all_series
