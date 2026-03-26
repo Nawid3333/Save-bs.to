@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import os
@@ -11,19 +10,6 @@ from datetime import datetime
 from config.config import SERIES_INDEX_FILE, DATA_DIR
 
 logger = logging.getLogger(__name__)
-
-
-def _compute_file_checksum(filepath):
-    """Compute SHA256 checksum of a file for corruption detection."""
-    try:
-        sha256_hash = hashlib.sha256()
-        with open(filepath, 'rb') as f:
-            for byte_block in iter(lambda: f.read(4096), b""):
-                sha256_hash.update(byte_block)
-        return sha256_hash.hexdigest()
-    except Exception as e:
-        logger.warning(f"Could not compute checksum for {filepath}: {e}")
-        return None
 
 
 def _create_file_backup(filepath):
