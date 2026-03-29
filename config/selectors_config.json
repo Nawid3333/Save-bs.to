@@ -12,6 +12,7 @@
         { "type": "css", "value": "button[type='submit']" },
         { "type": "css", "value": "button.btn-primary" }
       ],
+      "logged_in_indicator": "section.navigation a[href='logout']",
       "verification_markers": ["<a href=\"logout\">Logout</a>"]
     },
 

@@ -156,8 +156,8 @@ def _signal_handler(signum, frame):
 # Per-process PID file — each running instance gets its own file so they don't stomp each other
 _MY_PID_FILE = os.path.join(DATA_DIR, f'.worker_pids_{os.getpid()}.json')
 
-# Auto-clean stale PID files on startup (handles hard-killed terminals)
-cleanup_stale_worker_pids()
+# NOTE: cleanup_stale_worker_pids() is called once on first scraper
+# instantiation via BsToScraper.__init__(), not at import time.
 
 # Register cleanup handlers
 atexit.register(cleanup_geckodriver_processes)
@@ -177,8 +177,14 @@ class ScrapingPaused(Exception):
 
 class BsToScraper:
     """Config-based web scraper for BS.TO series"""
+
+    _stale_pids_cleaned = False
     
     def __init__(self):
+        if not BsToScraper._stale_pids_cleaned:
+            cleanup_stale_worker_pids()
+            BsToScraper._stale_pids_cleaned = True
+
         self.driver = None
         self.series_data = []
         self.config = SELECTORS_CONFIG
@@ -197,17 +203,85 @@ class BsToScraper:
         self._last_pause_check = 0.0
         self._pause_cached = False
         self.all_discovered_series = None
+        self.timing_file = os.path.join(DATA_DIR, '.scrape_timing.json')
+        self._historical_avg = None  # Loaded at scrape start from last run
         
         if not self.config:
             raise Exception("selectors_config.json not loaded. Check config.py")
     
+    # ==================== SCRAPE TIMING HELPERS ====================
+
+    def _load_scrape_timing(self):
+        """Load avg time per series from last completed scrape."""
+        try:
+            with open(self.timing_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            avg = data.get('avg_per_series')
+            if avg and avg > 0:
+                return float(avg)
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+        return None
+
+    def _save_scrape_timing(self, duration, series_count):
+        """Save timing data from completed scrape for future ETA estimates."""
+        if series_count <= 0:
+            return
+        data = {
+            'last_scrape_duration': round(duration, 2),
+            'series_count': series_count,
+            'avg_per_series': round(duration / series_count, 4),
+            'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S')
+        }
+        try:
+            self._atomic_write_json(self.timing_file, data)
+        except Exception as e:
+            logger.warning(f"Could not save scrape timing: {e}")
+
+    @staticmethod
+    def _compute_eta_mins(done, total, elapsed, historical_avg=None):
+        """Compute ETA in minutes, blending historical avg with current session.
+
+        At the start of a scrape the current-session average is unreliable
+        (based on only 1-2 samples).  When *historical_avg* is available
+        (from the previous completed scrape), the estimate starts from
+        the historical value and smoothly transitions to the live average
+        over the first 15% of the total series count.
+        """
+        if done <= 0:
+            if historical_avg:
+                return int((historical_avg * total) / 60)
+            return 0
+        current_avg = elapsed / done
+        if historical_avg is None:
+            effective_avg = current_avg
+        else:
+            blend = min(1.0, done / max(1, total * 0.15))
+            effective_avg = (1 - blend) * historical_avg + blend * current_avg
+        remaining = total - done
+        return int((effective_avg * remaining) / 60)
+
     # ==================== FILE I/O HELPERS ====================
     
     @staticmethod
     def _atomic_write_json(filepath, data):
-        """Write JSON atomically via temp file + os.replace."""
+        """Write JSON atomically via temp file + os.replace.
+        
+        Also checks disk space before writing to prevent corruption.
+        """
         dirpath = os.path.dirname(filepath)
         os.makedirs(dirpath, exist_ok=True)
+        
+        # Check disk space (need at least 1 MB free for writing)
+        try:
+            stat = shutil.disk_usage(dirpath)
+            if stat.free < 1024 * 1024:
+                raise OSError(f"Insufficient disk space for {filepath} (< 1 MB free)")
+        except OSError:
+            raise
+        except Exception as e:
+            logger.warning(f"Could not check disk space: {e}")
+        
         fd, tmp_path = tempfile.mkstemp(dir=dirpath, suffix='.tmp')
         try:
             with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -262,20 +336,26 @@ class BsToScraper:
         try:
             cookies = driver.get_cookies()
             cookie_names = {c['name'] for c in cookies}
-            session_indicators = {'session', 'PHPSESSID', 'laravel_session', 'remember_web', 'XSRF-TOKEN'}
+            # bs.to is PHP-based — check for PHP session cookies
+            session_indicators = {'PHPSESSID', 'session'}
             if cookie_names & session_indicators:
                 return True
             # Fallback: if we have 2+ cookies on the bs.to domain, session is likely alive
             site_domain = urlparse(self.get_site_url()).hostname
             domain_cookies = [c for c in cookies if site_domain in (c.get('domain', '') or '')]
-            return len(domain_cookies) >= 2
+            if len(domain_cookies) >= 2:
+                return True
+            logger.debug(f"_has_auth_cookies: no session indicators found. Cookies: {cookie_names}")
+            return False
         except Exception:
             return False
 
     def is_logged_in(self, driver):
-        """Check if authenticated by looking for the logout link in the navigation section."""
+        """Check if authenticated using configurable selector from login config."""
         try:
-            return len(driver.find_elements(By.CSS_SELECTOR, 'section.navigation a[href="logout"]')) > 0
+            login_config = self.get_selector('login') or {}
+            indicator = login_config.get('logged_in_indicator', "section.navigation a[href='logout']")
+            return len(driver.find_elements(By.CSS_SELECTOR, indicator)) > 0
         except Exception:
             return False
     
@@ -333,24 +413,50 @@ class BsToScraper:
         }
         return by_map.get(selector_type, By.CSS_SELECTOR)
 
-    def get_timing_float(self, key, default):
-        """Read a timing value from config as float (safe with None/missing values)."""
+    def get_timing_float(self, key, default, min_val=0.0, max_val=None):
+        """Read a timing value from config as float (safe with None/invalid values).
+        
+        Args:
+            key: Config key to retrieve
+            default: Default value if missing or invalid
+            min_val: Minimum allowed value (default: 0.0)
+            max_val: Maximum allowed value (default: None, no limit)
+        """
         try:
             value = self.get_timing(key, default)
-            if value is None:
+            if value is None or (isinstance(value, str) and value.lower() in ('null', 'none')):
                 return float(default) if default is not None else 0.0
-            return float(value)
+            result = float(value)
+            if min_val is not None:
+                result = max(result, min_val)
+            if max_val is not None:
+                result = min(result, max_val)
+            return result
         except (ValueError, TypeError):
+            logger.warning(f"Invalid timing value for {key}: {value}, using default {default}")
             return float(default) if default is not None else 0.0
 
-    def get_timing_int(self, key, default):
-        """Read a timing value from config as int (safe with None/missing values)."""
+    def get_timing_int(self, key, default, min_val=0, max_val=None):
+        """Read a timing value from config as int (safe with None/invalid values).
+        
+        Args:
+            key: Config key to retrieve
+            default: Default value if missing or invalid
+            min_val: Minimum allowed value (default: 0)
+            max_val: Maximum allowed value (default: None, no limit)
+        """
         try:
             value = self.get_timing(key, default)
-            if value is None:
+            if value is None or (isinstance(value, str) and value.lower() in ('null', 'none')):
                 return int(default) if default is not None else 0
-            return int(float(value))
+            result = int(float(value))
+            if min_val is not None:
+                result = max(result, min_val)
+            if max_val is not None:
+                result = min(result, max_val)
+            return result
         except (ValueError, TypeError):
+            logger.warning(f"Invalid timing value for {key}: {value}, using default {default}")
             return int(default) if default is not None else 0
     
     def find_element_from_config(self, driver, config_selectors, timeout=None):
@@ -504,9 +610,13 @@ class BsToScraper:
                     if isinstance(item, dict):
                         return item.get('url', item.get('link', ''))
                     return str(item)
-                merged = {_url_key(item): item for item in existing}
+                merged = {_url_key(item): item for item in existing if _url_key(item)}
                 for item in self.failed_links:
-                    merged[_url_key(item)] = item
+                    key = _url_key(item)
+                    if key:
+                        merged[key] = item
+                    else:
+                        logger.warning(f"Skipping failed item with empty URL: {item}")
                 self._atomic_write_json(self.failed_file, list(merged.values()))
             except Exception as e:
                 logger.error(f"Failed to save failed series list: {e}")
@@ -553,7 +663,9 @@ class BsToScraper:
             return False
     
     def clear_pause_request(self):
-        """Remove pause request file (atomic, safe on Windows)."""
+        """Remove pause request file and reset cache."""
+        self._pause_cached = False
+        self._last_pause_check = 0.0
         try:
             if os.path.exists(self.pause_file):
                 os.remove(self.pause_file)
@@ -689,7 +801,7 @@ class BsToScraper:
     
     # ==================== AUTHENTICATION ====================
     
-    def login(self, driver=None):
+    def login(self, driver=None, retry_count=0, max_retries=2):
         """Login to bs.to using JS injection.
         
         Targets the main #login-captcha form on /login page.
@@ -740,8 +852,12 @@ class BsToScraper:
             raise Exception(f"Login verification failed. URL: {drv.current_url}")
 
         except Exception as e:
+            if retry_count < max_retries:
+                logger.warning(f"Login attempt {retry_count + 1} failed: {e}, retrying...")
+                time.sleep(self.get_timing_float('worker_auth_retry_delay', 1.0))
+                return self.login(drv, retry_count=retry_count + 1, max_retries=max_retries)
             if drv is self.driver:
-                print(f"✗ Login failed: {str(e)}")
+                print(f"✗ Login failed after {retry_count + 1} attempts: {str(e)}")
             raise
     
     # ==================== SERIES DISCOVERY ====================
@@ -911,24 +1027,29 @@ class BsToScraper:
     def scrape_episodes_from_html(self, html):
         """Parse episodes table and return list of {number, title, watched}.
         Handles missing fields, None values, and malformed rows robustly.
+        
+        Returns:
+            tuple: (episodes_list, malformed_count) where malformed_count is
+                   the number of rows that failed to parse.
         """
         soup = BeautifulSoup(html, 'html.parser')
         episodes = []
+        malformed_count = 0
         
         episode_config = self.get_selector('episodes')
         if not episode_config or not isinstance(episode_config, dict):
-            return episodes
+            return episodes, malformed_count
         
         table_config = episode_config.get('table', {})
         if not isinstance(table_config, dict):
-            return episodes
+            return episodes, malformed_count
             
         table_type = table_config.get('type', 'css')
         table_value = table_config.get('value')
         
         # Validate selector value exists and is non-empty
         if not table_value:
-            return episodes
+            return episodes, malformed_count
         
         try:
             if table_type == 'css':
@@ -936,10 +1057,10 @@ class BsToScraper:
             else:
                 table = soup.find(str(table_value))
         except Exception:
-            return episodes
+            return episodes, malformed_count
         
         if not table:
-            return episodes
+            return episodes, malformed_count
         
         try:
             row_config = episode_config.get('table_rows', {})
@@ -961,17 +1082,23 @@ class BsToScraper:
             
             # Validate cell indices are non-negative
             if ep_num_cell < 0 or ep_title_cell < 0:
-                return episodes
+                return episodes, malformed_count
             
-            for row in rows:
+            for row_idx, row in enumerate(rows, start=1):
                 try:
                     cols = row.find_all('td')
                     if not cols or len(cols) <= max(ep_num_cell, ep_title_cell):
                         continue
                     
                     ep_num = cols[ep_num_cell].get_text(strip=True)
-                    if not ep_num:  # Skip empty episode numbers
-                        continue
+                    if not ep_num:
+                        # Filme/movie rows may lack episode numbers — fall back
+                        # to data-episode-season-id (ordinal number within season),
+                        # then to 1-based row index.
+                        ep_num = row.get('data-episode-season-id', '')
+                    if not ep_num:
+                        ep_num = str(row_idx)
+                        logger.debug(f"Episode number fallback to row index {row_idx}")
                     
                     title_col = cols[ep_title_cell]
                     title_tag = title_col.find(ep_title_selector) if ep_title_selector else None
@@ -985,34 +1112,79 @@ class BsToScraper:
                             row_classes = row_classes.split()
                         watched = bool(indicator_value and indicator_value in row_classes)
                     
-                    # Normalize episode number: use int where possible for proper sorting
-                    try:
-                        ep_num_normalized = int(ep_num)
-                    except (ValueError, TypeError):
-                        ep_num_normalized = str(ep_num)
+                    # Normalize episode number to string for consistent storage
                     episodes.append({
-                        'number': ep_num_normalized,
+                        'number': str(ep_num),
                         'title': str(title) if title else '',
                         'watched': bool(watched)  # Ensure bool type
                     })
-                except Exception:
-                    # Skip malformed rows
+                except Exception as e:
+                    malformed_count += 1
+                    logger.warning(f"Malformed episode row {row_idx}: {e}")
                     continue
         except Exception:
             pass  # Return whatever episodes were parsed before error
         
-        return episodes
+        return episodes, malformed_count
     
     # ==================== SERIES PROCESSING ====================
-    
+
+    _ERROR_TITLE_RE = re.compile(
+        r'^(?:Error\s+)?(?P<code>\d{3})\b|\b(?:Error|Fehler)\s+(?P<code2>\d{3})\b',
+        re.IGNORECASE,
+    )
+
+    _SERVER_ERROR_CODES = {
+        '429': '429 Too Many Requests',
+        '500': '500 Internal Server Error',
+        '502': '502 Bad Gateway',
+        '503': '503 Service Unavailable',
+        '504': '504 Gateway Timeout',
+    }
+
     def check_series_not_found_error(self, html):
-        """Return the German error text if the page says 'Serie nicht gefunden'."""
+        """Return the error text if the page indicates series not found (404)."""
         soup = BeautifulSoup(html, 'html.parser')
         error_div = soup.find('div', class_='messageBox error')
         if error_div:
             error_text = error_div.get_text(strip=True)
             if 'nicht gefunden' in error_text.lower():
                 return error_text
+        # If the page has series content (season links), it's a real series
+        # page — not an error page. This prevents false positives for series
+        # named "Error 404", "Fehler 404", etc.
+        if soup.select_one('#seasons a'):
+            return None
+        title_tag = soup.find('title')
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            m = self._ERROR_TITLE_RE.search(title_text)
+            if m:
+                code = m.group('code') or m.group('code2')
+                if code == '404':
+                    return title_text
+        h2_tag = soup.find('h2')
+        if h2_tag and h2_tag.get_text(strip=True) == '404':
+            p_tag = soup.find('p')
+            return p_tag.get_text(strip=True) if p_tag else '404 Nicht gefunden'
+        return None
+
+    def check_server_error(self, html):
+        """Check if page contains a server error (429, 500, 502, 503, 504)."""
+        soup = BeautifulSoup(html, 'html.parser')
+        title_tag = soup.find('title')
+        if title_tag:
+            title_text = title_tag.get_text(strip=True)
+            m = self._ERROR_TITLE_RE.search(title_text)
+            if m:
+                code = m.group('code') or m.group('code2')
+                if code in self._SERVER_ERROR_CODES:
+                    return self._SERVER_ERROR_CODES[code]
+        body_text = soup.get_text(strip=True) if soup.body else ''
+        for code, message in self._SERVER_ERROR_CODES.items():
+            reason = message.split(' ', 1)[1]
+            if code in body_text and reason in body_text:
+                return message
         return None
     
     def process_series_page(self, url, series_hint=None):
@@ -1107,6 +1279,10 @@ class BsToScraper:
             if page_content and ('Die Verbindung mit dem Server' in page_content or 'dnsNotFound' in page_content):
                 raise Exception(f"Reached error page content for: {url}")
 
+            server_error = self.check_server_error(page_content)
+            if server_error:
+                raise Exception(f"{server_error}: {url}")
+
             # Check for "Serie nicht gefunden" error page
             error_found = self.check_series_not_found_error(page_content)
             if error_found:
@@ -1145,6 +1321,7 @@ class BsToScraper:
             seasons_data = []
             total_watched = 0
             total_eps = 0
+            has_malformed_episodes = False
             max_retries = self._season_max_retries
 
             for idx, season_item in enumerate(season_links):
@@ -1162,6 +1339,9 @@ class BsToScraper:
                     episodes = []
                     season_failed = True
                     for attempt in range(max_retries):
+                        if not self._is_driver_alive(driver):
+                            logger.error(f"Driver died during season {season_label} retries — aborting series")
+                            break
                         try:
                             driver.get(season_url)
                             # Wait for the season page to finish loading before parsing.
@@ -1170,7 +1350,11 @@ class BsToScraper:
                             silent = attempt < max_retries - 1
                             if self.wait_for_css_element(driver, "table.episodes", timeout=self.get_timing_float('episodes_table_timeout', 8.0), silent=silent):
                                 season_html = driver.page_source
-                                episodes = self.scrape_episodes_from_html(season_html)
+                                episodes, malformed = self.scrape_episodes_from_html(season_html)
+                                if malformed > 0:
+                                    logger.warning(f"{malformed} malformed episode row(s) in season {season_label} of {url}")
+                                    print(f"  ⚠ {malformed} malformed episode row(s) in season {season_label} — marking series for retry")
+                                    has_malformed_episodes = True
                                 season_failed = False
                                 break
                             else:
@@ -1225,7 +1409,7 @@ class BsToScraper:
             total_watched = min(total_watched, total_eps)  # Watched can't exceed total
             unwatched = max(0, total_eps - total_watched)  # Never negative
 
-            return {
+            result = {
                 "title": str(title_value),  # Ensure string
                 "link": link,
                 "url": url,
@@ -1235,6 +1419,9 @@ class BsToScraper:
                 "unwatched_episodes": unwatched,
                 "seasons": seasons_data
             }
+            if has_malformed_episodes:
+                result["_has_malformed_episodes"] = True
+            return result
         except Exception as e:
             raise Exception(f"Series processing failed for {url}: {str(e)}")
     
@@ -1281,6 +1468,7 @@ class BsToScraper:
         all_series = self._filter_completed(all_series)
         if all_series is None:
             return
+        self._historical_avg = self._load_scrape_timing()
         start_time = time.time()
         try:
             for idx, series in enumerate(all_series, 1):
@@ -1288,13 +1476,28 @@ class BsToScraper:
                 if self.is_pause_requested():
                     break
 
+                # Recover dead driver before attempting the next series
+                if not self._is_driver_alive():
+                    logger.warning("Main driver died — restarting for sequential scrape")
+                    print("  ⚠ Browser crashed — restarting...")
+                    try:
+                        self.close()
+                    except Exception:
+                        pass
+                    try:
+                        self.setup_driver()
+                        self.login()
+                        logger.info("Main driver restarted successfully")
+                        print("  ✓ Browser restarted")
+                    except Exception as restart_err:
+                        logger.error(f"Failed to restart main driver: {restart_err}")
+                        print(f"  ✗ Failed to restart browser: {restart_err}")
+                        break
+
                 try:
                     # Calculate progress and ETA
                     elapsed = time.time() - start_time
-                    avg_time_per_series = elapsed / (idx - 1) if idx > 1 else 0
-                    remaining_series = len(all_series) - idx
-                    eta_seconds = avg_time_per_series * remaining_series
-                    eta_mins = int(eta_seconds / 60)
+                    eta_mins = self._compute_eta_mins(idx - 1, len(all_series), elapsed, self._historical_avg)
                     progress_pct = int((idx / len(all_series)) * 100)
                     
                     # Progress bar
@@ -1309,17 +1512,21 @@ class BsToScraper:
                         # Mark empty series
                         if result['total_episodes'] == 0:
                             result['empty'] = True
-                            print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ⚠ {result['title']}{season_info}: No episodes")
+                            print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | Fallback | ⚠ {result['title']}{season_info}: No episodes")
                         else:
                             result['empty'] = False
-                            print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ✓ {result['title']}{season_info}: {result['watched_episodes']}/{result['total_episodes']} watched")
+                            print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | Fallback | ✓ {result['title']}{season_info}: {result['watched_episodes']}/{result['total_episodes']} watched")
                         self.series_data.append(result)
+                        # Track series with parsing issues for rescrape
+                        if result.get('_has_malformed_episodes'):
+                            self.failed_links.append(series)
                         # Save checkpoint periodically
                         self.completed_links.add(series.get('link'))
                         if idx % CHECKPOINT_EVERY == 0:
                             self.save_checkpoint()
                     else:
-                        print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | ⚠ {series['title']}: Skipped (no data)")
+                        print(f"[{idx}/{len(all_series)}] [{bar}] {progress_pct}% | ETA: {eta_mins}m | Fallback | ⚠ {series['title']}: Skipped (no data)")
+                        self.failed_links.append(series)
                 except Exception as e:
                     print(f"  ⚠ Error processing {series['title']}: {str(e)}")
                     self.failed_links.append(series)
@@ -1345,6 +1552,7 @@ class BsToScraper:
         total_time = time.time() - start_time
         total_mins = int(total_time / 60)
         total_secs = int(total_time % 60)
+        self._save_scrape_timing(total_time, len(all_series))
         print(f"\n✓ Completed in {total_mins}m {total_secs}s", flush=True)
     
     def _scrape_series_parallel(self, all_series, worker_cap=None):
@@ -1356,6 +1564,7 @@ class BsToScraper:
         if all_series is None:
             return
 
+        self._historical_avg = self._load_scrape_timing()
         start_time = time.time()
         completed = 0
         failed = 0
@@ -1367,7 +1576,8 @@ class BsToScraper:
         total_series = len(filtered_series)
 
         max_workers_allowed = worker_cap if worker_cap is not None else MAX_WORKERS
-        worker_count = min(max_workers_allowed, total_series) or 1
+        # Scale workers: ~1 per 15 series, minimum 1, capped at max_workers_allowed
+        worker_count = min(max_workers_allowed, max(1, total_series // 15))
         
         # Shared work queue
         work_queue = queue.Queue()
@@ -1378,12 +1588,11 @@ class BsToScraper:
 
         def progress_line(done, total, title, watched=None, episode_total=None, empty=False, error=None, worker_id=None, season_labels=None):
             elapsed = time.time() - start_time
-            avg = elapsed / max(1, done + failed)
-            remaining = total - (done + failed)
-            eta_mins = int((avg * remaining) / 60)
-            pct = int(((done + failed) / total) * 100)
+            processed = done + failed
+            eta_mins = self._compute_eta_mins(processed, total, elapsed, self._historical_avg)
+            pct = int((processed / total) * 100)
             bar_len = 30
-            filled = int(bar_len * (done + failed) / total)
+            filled = int(bar_len * processed / total)
             bar = '█' * filled + '░' * (bar_len - filled)
             worker_info = f" | W{worker_id}/{worker_count}" if worker_id else f" | Workers: {worker_count}"
             season_info = f" [{','.join(season_labels)}]" if season_labels else ""
@@ -1470,6 +1679,9 @@ class BsToScraper:
                             empty = result.get('total_episodes', 0) == 0
                             result['empty'] = empty
                             self.series_data.append(result)
+                            # Track series with parsing issues for rescrape
+                            if result.get('_has_malformed_episodes'):
+                                self.failed_links.append(series)
                             self.completed_links.add(series.get('link'))
                             completed += 1
                             if completed % CHECKPOINT_EVERY == 0:
@@ -1482,6 +1694,7 @@ class BsToScraper:
                             
                         else:
                             failed += 1
+                            self.failed_links.append(series)
                             progress_line(completed, total_series, series.get('title', 'Series'), error='skipped', worker_id=worker_id)
                             error_streak += 1
                 except Exception as e:
@@ -1493,20 +1706,11 @@ class BsToScraper:
                             work_queue.put(series)
                         except Exception:
                             pass
-                        try:
-                            driver.quit()
-                        except Exception:
-                            pass
-                        try:
-                            driver = self._create_worker_driver(worker_id)
-                            cookies_ok = self._apply_cookies_to_driver(driver)
-                            if not cookies_ok:
-                                self.login(driver)
-                            error_streak = 0
-                            print(f"  ✓ Worker #{worker_id}: Browser restarted")
-                        except Exception as restart_err:
-                            logger.error(f"Worker #{worker_id}: Failed to restart driver: {restart_err}", exc_info=True)
+                        driver, ok = self._restart_worker_driver(worker_id, driver)
+                        if not ok:
                             break
+                        error_streak = 0
+                        print(f"  ✓ Worker #{worker_id}: Browser restarted")
                         continue
                     with lock:
                         failed += 1
@@ -1531,48 +1735,14 @@ class BsToScraper:
                 do_health_check = (tasks_since_check >= health_every) or (error_streak >= 3)
                 if do_health_check:
                     tasks_since_check = 0
-                    if not self._is_driver_alive(driver):
+                    error_streak, alive = self._worker_health_check(worker_id, driver, error_streak)
+                    if not alive:
                         break
-                    if error_streak >= 3:
-                        # Error streak: full page-navigation check
-                        try:
-                            if not self.is_logged_in(driver):
-                                driver.get(self.get_site_url())
-                                if not self.is_logged_in(driver):
-                                    try:
-                                        if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
-                                            self.login(driver)
-                                        error_streak = 0
-                                    except Exception:
-                                        error_streak += 1
-                        except Exception:
-                            error_streak += 1
-                    else:
-                        # Routine check: lightweight cookie check (no page loads)
-                        if not self._has_auth_cookies(driver):
-                            try:
-                                if not self.is_logged_in(driver):
-                                    try:
-                                        if not (self._apply_cookies_to_driver(driver) and self.is_logged_in(driver)):
-                                            self.login(driver)
-                                        error_streak = 0
-                                    except Exception:
-                                        error_streak += 1
-                            except Exception:
-                                error_streak += 1
 
                 if error_streak >= restart_threshold:
-                    try:
-                        driver.quit()
-                    except Exception:
-                        pass
-                    driver = self._create_worker_driver(worker_id)
-                    cookies_ok = self._apply_cookies_to_driver(driver)
-                    if not cookies_ok:
-                        try:
-                            self.login(driver)
-                        except Exception:
-                            pass
+                    driver, ok = self._restart_worker_driver(worker_id, driver)
+                    if not ok:
+                        break
                     error_streak = 0
 
             try:
@@ -1586,6 +1756,9 @@ class BsToScraper:
             for worker_id in range(1, worker_count + 1):
                 print(f"  🔺 Worker #{worker_id} starting")
                 futures.append(executor.submit(worker_loop, worker_id))
+                # Stagger worker startup so they don't all hit the site at once
+                if worker_id < worker_count:
+                    time.sleep(2.0)
 
             # Wait for all workers to complete
             for f in as_completed(futures):
@@ -1634,6 +1807,7 @@ class BsToScraper:
         total_time = time.time() - start_time
         total_mins = int(total_time / 60)
         total_secs = int(total_time % 60)
+        self._save_scrape_timing(total_time, total_series)
         if failed:
             print(f"\n✓ Completed in {total_mins}m {total_secs}s ({failed} failed)", flush=True)
         else:
@@ -1700,6 +1874,111 @@ class BsToScraper:
                     pass
             raise Exception(f"Failed to create worker driver: {str(e)}")
     
+    def _restart_worker_driver(self, worker_id, old_driver):
+        """Restart a worker's browser and re-authenticate via cookies or login.
+
+        Args:
+            worker_id: Worker number for logging.
+            old_driver: The crashed/stale driver to quit.
+
+        Returns:
+            tuple: (new_driver, success) — new_driver is None on failure.
+        """
+        try:
+            old_driver.quit()
+        except Exception:
+            pass
+        try:
+            driver = self._create_worker_driver(worker_id)
+            if not self._authenticate_driver(driver, label=f"Worker #{worker_id}"):
+                logger.error(f"Worker #{worker_id}: Failed to authenticate after restart")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                return None, False
+            return driver, True
+        except Exception as e:
+            logger.error(f"Worker #{worker_id}: Failed to restart driver: {e}", exc_info=True)
+            return None, False
+
+    def _worker_health_check(self, worker_id, driver, error_streak):
+        """Perform a health check on a worker driver and re-authenticate if needed.
+
+        Args:
+            worker_id: Worker number for logging.
+            driver: The worker's WebDriver.
+            error_streak: Current consecutive error count.
+
+        Returns:
+            tuple: (error_streak, driver_alive) — driver_alive is False if driver is dead.
+        """
+        if not self._is_driver_alive(driver):
+            return error_streak, False
+
+        needs_reauth = False
+        if error_streak >= 3:
+            try:
+                if not self.is_logged_in(driver):
+                    driver.get(self.get_site_url())
+                    if not self.is_logged_in(driver):
+                        needs_reauth = True
+            except Exception:
+                needs_reauth = True
+        else:
+            if not self._has_auth_cookies(driver):
+                try:
+                    if not self.is_logged_in(driver):
+                        needs_reauth = True
+                except Exception:
+                    needs_reauth = True
+
+        if needs_reauth:
+            label = f"Worker #{worker_id}"
+            if self._authenticate_driver(driver, label=label):
+                error_streak = 0
+            else:
+                error_streak += 1
+        return error_streak, True
+
+    def _authenticate_driver(self, driver, label=None, max_attempts=3):
+        """Authenticate a worker driver via cookies or full login.
+        
+        Tries cookie-based auth first, falls back to full login.
+        Retries up to max_attempts times.
+        
+        Args:
+            driver: WebDriver instance to authenticate
+            label: Label for log messages (e.g. 'Worker #3')
+            max_attempts: Number of auth attempts before giving up
+            
+        Returns:
+            bool: True if authenticated successfully
+        """
+        label = label or 'driver'
+        for attempt in range(max_attempts):
+            retry_delay = self.get_timing_float('worker_auth_retry_delay', 1.0)
+            try:
+                if self._apply_cookies_to_driver(driver) and self.is_logged_in(driver):
+                    logger.debug(f"{label}: authenticated via cookies")
+                    return True
+                else:
+                    self.login(driver)
+                    if self.is_logged_in(driver):
+                        logger.debug(f"{label}: authenticated via full login")
+                        return True
+                    else:
+                        logger.warning(f"{label}: login verification failed (attempt {attempt + 1}/{max_attempts})")
+                        print(f"  ⚠ {label}: Login verification failed (try {attempt + 1}/{max_attempts})")
+                        time.sleep(retry_delay)
+            except Exception as e:
+                logger.warning(f"{label}: auth exception (attempt {attempt + 1}/{max_attempts}): {e}")
+                print(f"  ⚠ {label}: Auth failed - {str(e)[:80]}")
+                time.sleep(retry_delay)
+
+        logger.error(f"{label}: failed to authenticate after {max_attempts} attempts")
+        return False
+
     def _apply_cookies_to_driver(self, driver):
         """Copy auth cookies to a worker driver (thread-safe snapshot)."""
         with self._worker_lock:

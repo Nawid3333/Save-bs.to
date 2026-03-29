@@ -347,12 +347,12 @@ def generate_report():
         meta = report['metadata']
         stats = meta['statistics']
         print(f"\n  Total series:       {stats['total_series']}")
-        print(f"  Watched (100%):     {stats['watched']}")
+        print(f"  Completed (100%):   {stats.get('completed_count', stats['watched'])}")
         
         ongoing_count = report['categories']['ongoing']['count']
         not_started_count = report['categories']['not_started']['count']
-        print(f"  Ongoing (started):  {ongoing_count}")
-        print(f"  Not started:        {not_started_count}")
+        print(f"  Ongoing (started):  {stats.get('ongoing_count', ongoing_count)}")
+        print(f"  Not started (0%):   {stats.get('not_started_count', not_started_count)}")
         print(f"  Generated:          {meta['generated']}")
         
         # Show ongoing series (started but incomplete)

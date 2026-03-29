@@ -3,7 +3,7 @@ import json
 from dotenv import load_dotenv
 
 # Load environment variables
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # Credentials (store in .env file)
 USERNAME = os.getenv("BS_USERNAME", "")

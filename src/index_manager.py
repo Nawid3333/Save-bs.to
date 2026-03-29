@@ -118,6 +118,17 @@ def _get_season_stats(series, season_label):
     return 0, 0
 
 
+def get_episode_counts(series):
+    """Get (total_episodes, watched_episodes) across all seasons of a series."""
+    total = 0
+    watched = 0
+    for season in series.get('seasons', []):
+        eps = season.get('episodes', [])
+        total += len(eps)
+        watched += sum(1 for ep in eps if ep.get('watched', False))
+    return total, watched
+
+
 def _order_series_entry(series):
     """Return a stable series dict with series-level metadata before seasons."""
     ordered = {
@@ -538,14 +549,9 @@ def _merge_series_data(old_data, new_dict, allow_watched, allow_unwatched):
 
         old_entry['seasons'] = list(old_seasons.values())
         old_entry['total_seasons'] = len(old_entry['seasons'])
-        old_entry['watched_episodes'] = sum(
-            sum(1 for ep in s.get('episodes', []) if ep.get('watched'))
-            for s in old_entry['seasons']
-        )
-        old_entry['total_episodes'] = sum(
-            len(s.get('episodes', []))
-            for s in old_entry['seasons']
-        )
+        total_eps, watched_eps = get_episode_counts(old_entry)
+        old_entry['watched_episodes'] = watched_eps
+        old_entry['total_episodes'] = total_eps
         old_entry['unwatched_episodes'] = old_entry['total_episodes'] - old_entry['watched_episodes']
         old_entry['url'] = new_entry.get('url', old_entry.get('url'))
         old_entry['last_updated'] = datetime.now().isoformat()
@@ -697,10 +703,16 @@ class IndexManager:
             "100%": sum(1 for p in completion_percentages if p == 100)
         }
         
-        # Top/bottom performers
-        sorted_by_completion = sorted(series_with_progress, key=lambda x: x['completion'], reverse=True)
-        most_completed = sorted_by_completion[:5] if len(sorted_by_completion) >= 5 else sorted_by_completion
-        least_completed = sorted_by_completion[-5:] if len(sorted_by_completion) >= 5 else sorted_by_completion
+        # Only consider ongoing series (started but not 100%) for most/least completed
+        ongoing_only = [s for s in series_with_progress if 0 < s['completion'] < 100]
+        sorted_ongoing = sorted(ongoing_only, key=lambda x: x['completion'], reverse=True)
+        most_completed = sorted_ongoing[:5]
+        least_completed = sorted_ongoing[-5:] if sorted_ongoing else []
+
+        # Series status counts
+        completed_count = watched
+        ongoing_count = len(ongoing_only)
+        not_started_count = sum(1 for s in series_with_progress if s['watched_episodes'] == 0)
         
         return {
             # Basic counts
@@ -709,6 +721,9 @@ class IndexManager:
             "unwatched": unwatched,
             "watched_percentage": round((watched / total * 100), 2),
             "empty_series": empty_count,
+            "completed_count": completed_count,
+            "ongoing_count": ongoing_count,
+            "not_started_count": not_started_count,
             
             # Completion analytics
             "average_completion": avg_completion,
@@ -722,17 +737,17 @@ class IndexManager:
             # Completion distribution
             "completion_distribution": completion_ranges,
             
-            # Top performers
+            # Top ongoing performers
             "most_completed_series": [
                 {"title": s['title'], "completion": s['completion'], "progress": f"{s['watched_episodes']}/{s['total_episodes']}"}
                 for s in most_completed
             ],
             
-            # Bottom performers (excluding 100% completed)
+            # Bottom ongoing performers
             "least_completed_series": [
                 {"title": s['title'], "completion": s['completion'], "progress": f"{s['watched_episodes']}/{s['total_episodes']}"}
-                for s in least_completed if s['completion'] < 100
-            ][:5]  # Limit to 5, excluding 100% completed
+                for s in least_completed
+            ]
         }
         
     def get_full_report(self):
